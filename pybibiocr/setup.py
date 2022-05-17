@@ -2,14 +2,41 @@
 from setuptools import setup, find_packages
 from Cython.Build import cythonize
 
+# import compileall
+# compileall.compile_dir('onnx', force=True)
+
 pyfiles = ["bibiocr.py",
-           "mainwindow.py"]
+           "mainwindow.py",
+           "./onnx/cnocr_lite/angnet/angle.py",
+           # "./onnx/cnocr_lite/angnet/__init__.py",
+           "./onnx/cnocr_lite/config.py",
+           "./onnx/cnocr_lite/crnn/CRNN.py",
+           "./onnx/cnocr_lite/crnn/keys.py",
+           "./onnx/cnocr_lite/crnn/util.py",
+           # "./onnx/cnocr_lite/crnn/__init__.py",
+           "./onnx/cnocr_lite/dbnet/dbnet_infer.py",
+           "./onnx/cnocr_lite/dbnet/decode.py",
+           "./onnx/cnocr_lite/model.py",
+           "./onnx/cnocr_lite/ocr_run.py",
+           "./onnx/cnocr_lite/utils.py",
+           # "./onnx/cnocr_lite/__init__.py",
+           "./onnx/rapid_ocr/ch_ppocr_mobile_v2_cls/text_cls.py",
+           "./onnx/rapid_ocr/ch_ppocr_mobile_v2_cls/utils.py",
+           # "./onnx/rapid_ocr/ch_ppocr_mobile_v2_cls/__init__.py",
+           "./onnx/rapid_ocr/ch_ppocr_mobile_v2_det/text_detect.py",
+           "./onnx/rapid_ocr/ch_ppocr_mobile_v2_det/utils.py",
+           # "./onnx/rapid_ocr/ch_ppocr_mobile_v2_det/__init__.py",
+           "./onnx/rapid_ocr/ch_ppocr_mobile_v2_rec/text_recognize.py",
+           "./onnx/rapid_ocr/ch_ppocr_mobile_v2_rec/utils.py",
+           # "./onnx/rapid_ocr/ch_ppocr_mobile_v2_rec/__init__.py",
+           # "./onnx/rapid_ocr/__init__.py",
+           # "./onnx/__init__.py",
+           ]
 setup(
-    name="bibiocr",
+    name="pybibiocr",
     version="1.0",
     packages=find_packages(),
-    py_modules=[  # 在 package 之外添加两个独立的 module
-        'onnx'
+    py_modules=[  # 在 package 之外添加独立的 module
     ],
     ext_modules=cythonize(pyfiles),
 
@@ -26,6 +53,6 @@ setup(
     ],
     scripts=pyfiles,
     package_data={
-        'bibiocr': ['config.json', 'bibiocr.ico', 'onnx/models/*']
+        'pybibiocr': ['config.json', 'bibiocr.ico', 'onnx/models/*']
     }
 )

@@ -1,0 +1,8 @@
+onnxruntime==1.7.0
+imageio==2.8.0
+opencv-python==3.4.2.17
+pillow==9.1.0
+pyqt5==5.15.2
+pyqt5-tools==5.15.2.3.2
+Shapely==1.7.0
+pyclipper==1.2.0
