@@ -6,7 +6,7 @@ It is very simple and only support one image processing at one time.
 
 It supports clipboard image processing and copy text to clipboard. 
 
-![](bibocr_demo.png)
+![](bibocr_1.1_demo.png)
 
 # Python 3.7 + PyQT5
 
