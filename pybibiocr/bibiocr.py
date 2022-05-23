@@ -3,10 +3,13 @@ import sys
 from collections import OrderedDict
 
 import math
-from PyQt5.QtCore import QObject, pyqtSignal, QThread, Qt
+from PyQt5.QtCore import QObject, pyqtSignal, QThread, Qt, QUrl, QProcess
 from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent, QSoundEffect
+
 from mainwindow import Ui_MainWindow
-from PyQt5.QtWidgets import QApplication, QMainWindow, QGraphicsScene, QGraphicsPixmapItem, QMessageBox, QFileDialog
+from PyQt5.QtWidgets import QApplication, QMainWindow, QGraphicsScene, QGraphicsPixmapItem, QMessageBox, QFileDialog, \
+    QTableWidgetItem
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 import cv2
@@ -48,10 +51,10 @@ except:
 
 local_root = os.path.dirname(__file__)
 os.chdir(os.path.abspath(os.path.dirname(__file__)))
+local_ttsmp3_tempfile = os.path.abspath('~edge_tts_zh-CN-XiaomoNeural.mp3')
 
 
 ########################################################################################################################
-
 
 
 ########################################################################################################################
@@ -163,10 +166,10 @@ def cvMat2QImage(cvMat):
 
 
 ########################################################################################################################
-def get_config():
-    with open(os.path.join(local_root, "config.json"), "r", encoding='utf8') as jsonfile:
+def get_config(name='config.json'):
+    with open(os.path.join(local_root, name), "r", encoding='utf8') as jsonfile:
         data = json.load(jsonfile)
-        logger.info(f"Read config.json successfully:\n{data}\n")
+        logger.info(f"Read {name} successfully:\n{data}\n")
         jsonfile.close()
     return data
 
@@ -175,11 +178,11 @@ def get_config_path(path):
     return os.path.abspath(os.path.join(local_root, path))
 
 
-def get_args():
-    config = get_config()
+def get_args(name='config.json'):
+    config = get_config(name)
     args = OrderedDict()
     args.__dict__.update(config)
-    logger.info(f"OCR args:\n{json.dumps(args.__dict__, indent=4)}\n")
+    logger.info(f"{name} args:\n{json.dumps(args.__dict__, indent=4)}\n")
     return args
 
 
@@ -311,6 +314,107 @@ def get_rotate_crop_image(img, points):
 
 ########################################################################################################################
 
+
+class Pyttsx3Thread(QThread):
+
+    def __init__(self, txt):
+        super(Pyttsx3Thread, self).__init__()
+        self.txt = txt
+
+    def run(self):
+        import pyttsx3
+        engine = pyttsx3.init(debug=True)
+        volume = engine.getProperty('volume')
+        engine.setProperty('volume', 1.0)
+        engine.say(self.txt)
+        engine.runAndWait()
+        engine.stop()
+
+
+# class Edge_ttsThread(QThread):
+#     def __init__(self, txt=None):
+#         super(Edge_ttsThread, self).__init__()
+#         self.txt = txt
+#
+#     def run(self):
+#         def text_to_mp3(txt, mp3file):
+#             def find_edge_tts(dir=None):
+#                 edge_tts_exe = 'edge-tts.exe'
+#                 if dir is not None:
+#                     edge_tts_path = os.path.join(dir, edge_tts_exe)
+#                     if os.path.exists(edge_tts_path):
+#                         return os.path.abspath(edge_tts_path)
+#                 edge_tts_path = os.path.join('binary', edge_tts_exe)
+#                 if os.path.exists(edge_tts_path):
+#                     return os.path.abspath(edge_tts_path)
+#                 if os.path.exists(edge_tts_exe):
+#                     return os.path.abspath(edge_tts_exe)
+#                 return edge_tts_exe
+#
+#             program = QProcess()
+#             program.start(find_edge_tts(), ['--voice', 'zh-CN-XiaomoNeural', '--text', txt, '--write-media',
+#                                             mp3file])
+#             program.waitForFinished()
+#
+#         if os.path.exists(local_ttsmp3_tempfile):
+#             os.remove(local_ttsmp3_tempfile)
+#         text_to_mp3(self.txt, local_ttsmp3_tempfile)
+#         logger.info(f"Generated {self.txt} into TTS file{local_ttsmp3_tempfile}")
+
+
+class EdgeTtsThread(QThread):
+    def __init__(self, txt=''):
+        super(EdgeTtsThread, self).__init__()
+        self.txt = txt.replace('\n', '')
+        self.args = get_args('edge_tts.json')
+
+    def run(self):
+        from edge_tts import Communicate, SubMaker, list_voices
+        import asyncio
+        async def _tts(text, args):
+            tts = Communicate()
+            subs = SubMaker(args.overlapping)
+            if args.write_media:
+                media_file = open(get_config_path(args.write_media), "wb")  # pylint: disable=consider-using-with
+            if args.custom_ssml:
+                args.custom_ssml = get_config_path(args.custom_ssml)
+            async for i in tts.run(
+                    text,
+                    args.boundary_type,
+                    args.codec,
+                    args.voice,
+                    args.pitch,
+                    args.rate,
+                    args.volume,
+                    customspeak=args.custom_ssml,
+            ):
+                if i[2] is not None:
+                    if not args.write_media:
+                        sys.stdout.buffer.write(i[2])
+                    else:
+                        media_file.write(i[2])
+                elif i[0] is not None and i[1] is not None:
+                    subs.create_sub(i[0], i[1])
+            if args.write_media:
+                media_file.close()
+            if not args.write_subtitles:
+                sys.stderr.write(subs.generate_subs())
+            else:
+                with open(get_config_path(args.write_subtitles), "w", encoding="utf-8") as file:
+                    srt = subs.generate_subs()
+                    file.write(srt)
+                    logger.info(f"subtitles: {srt}")
+
+        if os.path.exists(get_config_path(self.args.write_media)):
+            os.remove(get_config_path(self.args.write_media))
+        if os.path.exists(get_config_path(self.args.write_subtitles)):
+            os.remove(get_config_path(self.args.write_subtitles))
+        asyncio.new_event_loop().run_until_complete(_tts(self.txt, self.args))
+        logger.info(f"Generated {self.txt} into TTS file{local_ttsmp3_tempfile}")
+
+
+########################################################################################################################
+
 class OcrWorker(QObject):
     finished = pyqtSignal()
     progress = pyqtSignal(int)
@@ -337,8 +441,34 @@ class OcrWorker(QObject):
             txt, prob = rec_res[i]
             # x1, y1, x2, y2, x3, y3, x4, y4 = box.reshape(-1)
             s_table.append(
-                f"({box[0][0]},\t{box[0][1]})\t({box[1][0]},\t{box[1][1]})\t({box[2][0]},\t{box[2][1]})\t({box[3][0]},\t{box[3][1]})\t{prob:.3f}\t{txt}")
+                f"({box[0][0]:.0f},\t{box[0][1]:.0f})\t({box[1][0]:.0f},\t{box[1][1]:.0f})\t({box[2][0]:.0f},\t{box[2][1]:.0f})\t({box[3][0]:.0f},\t{box[3][1]:.0f})\t{prob:.3f}\t{txt}")
         return "\n".join(s_table)
+
+    @staticmethod
+    def rec2text(dt_boxes, rec_res):
+        from io import StringIO
+        f = StringIO()
+
+        def box_same_line(box1, box2):
+            x11, y11, x12, y12, x13, y13, x14, y14 = box1.reshape(-1)
+            x21, y21, x22, y22, x23, y23, x24, y24 = box2.reshape(-1)
+            if abs(y14 - y11) + abs(y24 - y21) > 1.1 * abs(y24 - y11):
+                return True
+            else:
+                return False
+
+        for i in range(len(dt_boxes)):
+            box = dt_boxes[i]
+            txt, prob = rec_res[i]
+            if i == 0:
+                f.write(txt)
+            else:
+                if box_same_line(dt_boxes[i - 1], dt_boxes[i]):
+                    f.write('\t')
+                else:
+                    f.write('\n')
+                f.write(txt)
+        return f.getvalue()
 
     def run_rapid_ocr(self, img):
         img = img.copy()
@@ -430,7 +560,8 @@ class OcrWorker(QObject):
         self.result['ocr'] = self.run_rapid_ocr(self.img)
         logger.info(f"finish ocr function.")
         self.result['text'] = self.rec2table(*self.result['ocr'])
-        self.result['pure_text'] = "\n".join([item[0] for item in self.result['ocr'][1]])
+        # self.result['pure_text'] = "\n".join([item[0] for item in self.result['ocr'][1]])
+        self.result['pure_text'] = self.rec2text(*self.result['ocr'])
         self.progress.emit(90)
         self.result['image'] = vis_img(self.img, *self.result['ocr'], self.args)
         logger.info(f"END ocr process !!!")
@@ -446,6 +577,8 @@ class MainWindow(Ui_MainWindow, QMainWindow):
         self.clipboard = QApplication.clipboard()
         self.toolButton_3.setEnabled(False)
         self.toolButton_4.setEnabled(False)
+        self.toolButton_5.setEnabled(False)
+        self.toolButton_8.setEnabled(False)
 
         self.toolButton.clicked.connect(
             self.on_toolButton_click
@@ -462,25 +595,54 @@ class MainWindow(Ui_MainWindow, QMainWindow):
             self.on_toolButton_4_click
         )
 
+        self.toolButton_5.clicked.connect(
+            self.on_toolButton_5_click
+        )
+
+        self.toolButton_6.clicked.connect(
+            self.on_toolButton_6_click
+        )
+
+        self.toolButton_7.clicked.connect(
+            self.on_toolButton_7_click
+        )
+
+        self.toolButton_8.clicked.connect(
+            self.on_toolButton_8_click
+        )
+
         self.action.triggered.connect(
             self.on_toolButton_click
         )
         self.action_2.triggered.connect(
-            self.on_toolButton_2_click
+            self.on_toolButton_7_click
         )
         self.action_3.triggered.connect(
-            self.on_toolButton_3_click
+            self.on_toolButton_2_click
         )
         self.action_4.triggered.connect(
-            self.on_toolButton_4_click
+            self.on_toolButton_6_click
         )
         self.action_5.triggered.connect(
-            self.close
+            self.on_toolButton_4_click
         )
         self.action_6.triggered.connect(
+            self.on_toolButton_3_click
+        )
+        self.action_7.triggered.connect(
+            self.on_toolButton_5_click
+        )
+        self.action_8.triggered.connect(
+            self.on_toolButton_8_click
+        )
+        self.action_9.triggered.connect(
+            self.close
+        )
+        self.action_10.triggered.connect(
             lambda: QMessageBox.about(self, '关于作者', 'mail:chunqishi@gmail.com, wechat:chunqishi')
         )
         self.result = {}
+        self.needread = False
 
     def closeEvent(self, event):
         reply = QMessageBox.question(self, '关闭提示', "是否要关闭程序?",
@@ -500,6 +662,8 @@ class MainWindow(Ui_MainWindow, QMainWindow):
             self.toolButton_2.setEnabled(False)
             self.toolButton_3.setEnabled(False)
             self.toolButton_4.setEnabled(False)
+            self.toolButton_5.setEnabled(False)
+            self.toolButton_8.setEnabled(False)
             self.progressBar.setProperty("value", 0)
             qImage = cvMat2QImage(img)
             self.graphicsView.geometry()
@@ -524,6 +688,8 @@ class MainWindow(Ui_MainWindow, QMainWindow):
             self.worker.progress.connect(self.reportProgress)
             # Step 6: Start the thread
             self.thread.start()
+            # Step 7: init TTS Thread
+            # self.ttsthread = Edge_ttsThread()
         except Exception as exp:
             import traceback, sys
             traceback.print_exc()
@@ -536,6 +702,7 @@ class MainWindow(Ui_MainWindow, QMainWindow):
             self.toolButton_2.setEnabled(True)
             self.toolButton_3.setEnabled(True)
             self.toolButton_4.setEnabled(True)
+            self.toolButton_5.setEnabled(True)
             qImage = cvMat2QImage(self.result.get('image', None))
             if qImage is not None:
                 pmp = QPixmap(qImage)
@@ -544,13 +711,53 @@ class MainWindow(Ui_MainWindow, QMainWindow):
                 self.graphicsView_2.setScene(scene)
                 # self.graphicsView_2.fitInView(scene.sceneRect(), mode=Qt.KeepAspectRatio)
                 self.graphicsView_2.update()
-                self.textBrowser.setText(self.result.get('text', ''))
+                self.textBrowser.setText(self.result.get('pure_text', ''))
+                self.textBrowser.show()
+
+            colnames = ['x1 (px)', 'y1 (px)', 'x2 (px)', 'y2 (px)', 'x3 (px)', 'y3 (px)', 'x4 (px)', 'y4 (px)', 'prob.',
+                        'text']
+            dt_boxes, rec_res = self.result['ocr']
+            self.tableWidget.setWindowTitle(f"图片识别结果[{len(rec_res)}]")
+            self.tableWidget.setColumnCount(len(colnames))
+            self.tableWidget.setRowCount(len(dt_boxes))
+            self.tableWidget.setHorizontalHeaderLabels(colnames)
+            for i, box in enumerate(dt_boxes):
+                txt, prob = rec_res[i]
+                self.tableWidget.setItem(i, 0, QTableWidgetItem(f"{box[0][0]:.0f}"))
+                self.tableWidget.setItem(i, 1, QTableWidgetItem(f"{box[0][1]:.0f}"))
+                self.tableWidget.setItem(i, 2, QTableWidgetItem(f"{box[1][0]:.0f}"))
+                self.tableWidget.setItem(i, 3, QTableWidgetItem(f"{box[1][1]:.0f}"))
+                self.tableWidget.setItem(i, 4, QTableWidgetItem(f"{box[2][0]:.0f}"))
+                self.tableWidget.setItem(i, 5, QTableWidgetItem(f"{box[2][1]:.0f}"))
+                self.tableWidget.setItem(i, 6, QTableWidgetItem(f"{box[3][0]:.0f}"))
+                self.tableWidget.setItem(i, 7, QTableWidgetItem(f"{box[3][1]:.0f}"))
+                self.tableWidget.setItem(i, 8, QTableWidgetItem(f"{prob:.3f}"))
+                self.tableWidget.setItem(i, 9, QTableWidgetItem(txt))
+            self.tableWidget.show()
+            if self.needread:
+                pure_text = self.result.get('pure_text', '')
+                # self.thread = Pyttsx3Thread(pure_text)
+                self.ttsthread = EdgeTtsThread(pure_text)
+                self.ttsthread.finished.connect(self.ttsthread.deleteLater)
+                self.ttsthread.start()
+
+                def play_tts():
+                    self.toolButton_8.setEnabled(True)
+                    self.player = QMediaPlayer()
+                    self.player.setMedia(QMediaContent(QUrl.fromLocalFile(local_ttsmp3_tempfile)))
+                    self.player.setVolume(100)
+                    self.player.play()
+
+                self.ttsthread.finished.connect(
+                    lambda: play_tts()
+                )
 
         self.thread.finished.connect(
             lambda: show_result()
         )
 
-    def on_toolButton_click(self):
+    def on_toolButton_click(self, needread=False):
+        self.needread = needread
         mimedata = self.clipboard.mimeData()
         if mimedata.hasImage():
             qimg = self.clipboard.image()
@@ -560,7 +767,12 @@ class MainWindow(Ui_MainWindow, QMainWindow):
         else:
             QMessageBox.warning(self, '剪贴板无图片', '请复制图片到剪贴板！', QMessageBox.Ok, QMessageBox.Ok)
 
-    def on_toolButton_2_click(self):
+    def on_toolButton_7_click(self):
+        self.needread = True
+        self.on_toolButton_click(True)
+
+    def on_toolButton_2_click(self, needread=False):
+        self.needread = needread
         filename, filetype = QFileDialog.getOpenFileName(self, "选择图片文件", os.getcwd(),
                                                          "Image Files(*.bmp;*.png;*.jpg;*.jpeg;*.gif);;All Files(*)")
 
@@ -574,14 +786,59 @@ class MainWindow(Ui_MainWindow, QMainWindow):
         else:
             QMessageBox.warning(self, '未打开图片', '请选择图片文件！', QMessageBox.Ok, QMessageBox.Ok)
 
+    def on_toolButton_6_click(self):
+        self.needread = True
+        self.on_toolButton_2_click(True)
+
     def on_toolButton_3_click(self):
-        text = self.textBrowser.document().toPlainText()
-        self.clipboard.setText(text)
+        self.clipboard.setText(self.result.get('text', ""))
         QMessageBox.information(self, '拷贝到剪贴板', '已将识别文本详细内容拷贝到剪贴板', QMessageBox.Ok, QMessageBox.Ok)
 
     def on_toolButton_4_click(self):
         self.clipboard.setText(self.result.get('pure_text', ""))
         QMessageBox.information(self, '拷贝到剪贴板', '已将识别结果文本部分拷贝到剪贴板', QMessageBox.Ok, QMessageBox.Ok)
+
+    def on_toolButton_5_click(self):
+        csv_file, filetype = QFileDialog.getSaveFileName(self, '选择保存路径', os.path.join(os.getcwd(), '图片识别结果.csv'),
+                                                         "CSV File(*.csv);;All Files(*)")
+        if csv_file is None or len(csv_file) <= 3:
+            QMessageBox.warning(self, '未选择保存路径', '请选择CSV文件保存路径！', QMessageBox.Ok, QMessageBox.Ok)
+        else:
+            dt_boxes, rec_res = self.result['ocr']
+            logger.info(f'csv_file = {csv_file}')
+            logger.info(f'dt_boxes = {dt_boxes}; rec_res = {rec_res}')
+            with open(csv_file, "w", encoding='utf-8-sig', newline='') as csvFile:
+                logger.info(f'csvFile = {csvFile}')
+                import csv
+                wr = csv.writer(csvFile, quotechar=',')
+                titles = ['x1 (px)', 'y1 (px)', 'x2 (px)', 'y2 (px)', 'x3 (px)', 'y3 (px)', 'x4 (px)', 'y4 (px)', 'prob.',
+                          'text']
+                wr.writerow(titles)
+                for i, box in enumerate(dt_boxes):
+                    txt, prob = rec_res[i]
+                    wr.writerow([f"{box[0][0]:.0f}",
+                                 f"{box[0][1]:.0f}",
+                                 f"{box[1][0]:.0f}",
+                                 f"{box[1][1]:.0f}",
+                                 f"{box[2][0]:.0f}",
+                                 f"{box[2][1]:.0f}",
+                                 f"{box[3][0]:.0f}",
+                                 f"{box[3][1]:.0f}",
+                                 f"{prob:.3f}",
+                                 txt
+                                 ])
+            QMessageBox.information(self, '保存成功', f'已将识别信息保存到“{csv_file}“', QMessageBox.Ok, QMessageBox.Ok)
+
+    def on_toolButton_8_click(self):
+        mp3_file, filetype = QFileDialog.getSaveFileName(self, '选择保存路径', os.path.join(os.getcwd(), '图片文字朗读.mp3'),
+                                                         "MP3 File(*.mp3);;All Files(*)")
+        if mp3_file is None or len(mp3_file) <= 3:
+            QMessageBox.warning(self, '未选择保存路径', '请选择MP3文件保存路径！', QMessageBox.Ok, QMessageBox.Ok)
+        else:
+            import shutil
+            shutil.copy(local_ttsmp3_tempfile, mp3_file)
+            logger.info(f'mp3File = {mp3_file}')
+            QMessageBox.information(self, '保存成功', f'已将图片文字朗读保存到“{mp3_file}“', QMessageBox.Ok, QMessageBox.Ok)
 
 
 if __name__ == '__main__':

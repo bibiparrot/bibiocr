@@ -1,0 +1,13 @@
+{
+  "custom_ssml": false,
+  "voice": "Microsoft Server Speech Text to Speech Voice (zh-CN, XiaomoNeural)",
+  "codec": "audio-24khz-48kbitrate-mono-mp3",
+  "list_voices": true,
+  "pitch": "+0Hz",
+  "rate": "+0%",
+  "volume": "+0%",
+  "overlapping": 5,
+  "boundary_type": 0,
+  "write_media": "~edge_tts_zh-CN-XiaomoNeural.mp3",
+  "write_subtitles": "~edge_tts_zh-CN-XiaomoNeural.srt"
+}

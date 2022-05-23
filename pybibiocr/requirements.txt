@@ -6,3 +6,5 @@ pyqt5==5.15.2
 pyqt5-tools==5.15.2.3.2
 Shapely==1.7.0
 pyclipper==1.2.0
+#pyttsx3==2.90
+edge-tts==4.0.9
