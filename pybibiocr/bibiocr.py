@@ -575,10 +575,11 @@ class MainWindow(Ui_MainWindow, QMainWindow):
         self.setupUi(self)
         self.show()
         self.clipboard = QApplication.clipboard()
-        self.toolButton_3.setEnabled(False)
-        self.toolButton_4.setEnabled(False)
         self.toolButton_5.setEnabled(False)
+        self.toolButton_6.setEnabled(False)
+        self.toolButton_7.setEnabled(False)
         self.toolButton_8.setEnabled(False)
+        self.toolButton_9.setEnabled(False)
 
         self.toolButton.clicked.connect(
             self.on_toolButton_click
@@ -611,34 +612,41 @@ class MainWindow(Ui_MainWindow, QMainWindow):
             self.on_toolButton_8_click
         )
 
+        self.toolButton_9.clicked.connect(
+            self.on_toolButton_9_click
+        )
+
         self.action.triggered.connect(
             self.on_toolButton_click
         )
         self.action_2.triggered.connect(
-            self.on_toolButton_7_click
-        )
-        self.action_3.triggered.connect(
             self.on_toolButton_2_click
         )
-        self.action_4.triggered.connect(
-            self.on_toolButton_6_click
-        )
-        self.action_5.triggered.connect(
-            self.on_toolButton_4_click
-        )
-        self.action_6.triggered.connect(
+        self.action_3.triggered.connect(
             self.on_toolButton_3_click
         )
-        self.action_7.triggered.connect(
+        self.action_4.triggered.connect(
+            self.on_toolButton_4_click
+        )
+        self.action_5.triggered.connect(
             self.on_toolButton_5_click
+        )
+        self.action_6.triggered.connect(
+            self.on_toolButton_6_click
+        )
+        self.action_7.triggered.connect(
+            self.on_toolButton_7_click
         )
         self.action_8.triggered.connect(
             self.on_toolButton_8_click
         )
         self.action_9.triggered.connect(
-            self.close
+            self.on_toolButton_9_click
         )
         self.action_10.triggered.connect(
+            self.close
+        )
+        self.action_11.triggered.connect(
             lambda: QMessageBox.about(self, '关于作者', 'mail:chunqishi@gmail.com, wechat:chunqishi')
         )
         self.result = {}
@@ -663,7 +671,10 @@ class MainWindow(Ui_MainWindow, QMainWindow):
             self.toolButton_3.setEnabled(False)
             self.toolButton_4.setEnabled(False)
             self.toolButton_5.setEnabled(False)
+            self.toolButton_6.setEnabled(False)
+            self.toolButton_7.setEnabled(False)
             self.toolButton_8.setEnabled(False)
+            self.toolButton_9.setEnabled(False)
             self.progressBar.setProperty("value", 0)
             qImage = cvMat2QImage(img)
             self.graphicsView.geometry()
@@ -702,7 +713,6 @@ class MainWindow(Ui_MainWindow, QMainWindow):
             self.toolButton_2.setEnabled(True)
             self.toolButton_3.setEnabled(True)
             self.toolButton_4.setEnabled(True)
-            self.toolButton_5.setEnabled(True)
             qImage = cvMat2QImage(self.result.get('image', None))
             if qImage is not None:
                 pmp = QPixmap(qImage)
@@ -734,6 +744,12 @@ class MainWindow(Ui_MainWindow, QMainWindow):
                 self.tableWidget.setItem(i, 8, QTableWidgetItem(f"{prob:.3f}"))
                 self.tableWidget.setItem(i, 9, QTableWidgetItem(txt))
             self.tableWidget.show()
+
+            self.toolButton_5.setEnabled(True)
+            self.toolButton_6.setEnabled(True)
+            self.toolButton_7.setEnabled(True)
+            self.toolButton_8.setEnabled(True)
+
             if self.needread:
                 pure_text = self.result.get('pure_text', '')
                 # self.thread = Pyttsx3Thread(pure_text)
@@ -742,7 +758,7 @@ class MainWindow(Ui_MainWindow, QMainWindow):
                 self.ttsthread.start()
 
                 def play_tts():
-                    self.toolButton_8.setEnabled(True)
+                    self.toolButton_9.setEnabled(True)
                     self.player = QMediaPlayer()
                     self.player.setMedia(QMediaContent(QUrl.fromLocalFile(local_ttsmp3_tempfile)))
                     self.player.setVolume(100)
@@ -767,11 +783,11 @@ class MainWindow(Ui_MainWindow, QMainWindow):
         else:
             QMessageBox.warning(self, '剪贴板无图片', '请复制图片到剪贴板！', QMessageBox.Ok, QMessageBox.Ok)
 
-    def on_toolButton_7_click(self):
+    def on_toolButton_2_click(self):
         self.needread = True
         self.on_toolButton_click(True)
 
-    def on_toolButton_2_click(self, needread=False):
+    def on_toolButton_3_click(self, needread=False):
         self.needread = needread
         filename, filetype = QFileDialog.getOpenFileName(self, "选择图片文件", os.getcwd(),
                                                          "Image Files(*.bmp;*.png;*.jpg;*.jpeg;*.gif);;All Files(*)")
@@ -786,19 +802,37 @@ class MainWindow(Ui_MainWindow, QMainWindow):
         else:
             QMessageBox.warning(self, '未打开图片', '请选择图片文件！', QMessageBox.Ok, QMessageBox.Ok)
 
-    def on_toolButton_6_click(self):
+    def on_toolButton_4_click(self):
         self.needread = True
         self.on_toolButton_2_click(True)
 
-    def on_toolButton_3_click(self):
+    def on_toolButton_5_click(self):
         self.clipboard.setText(self.result.get('text', ""))
         QMessageBox.information(self, '拷贝到剪贴板', '已将识别文本详细内容拷贝到剪贴板', QMessageBox.Ok, QMessageBox.Ok)
 
-    def on_toolButton_4_click(self):
+    def on_toolButton_6_click(self):
         self.clipboard.setText(self.result.get('pure_text', ""))
         QMessageBox.information(self, '拷贝到剪贴板', '已将识别结果文本部分拷贝到剪贴板', QMessageBox.Ok, QMessageBox.Ok)
 
-    def on_toolButton_5_click(self):
+    def on_toolButton_7_click(self):
+        text = self.textBrowser.document().toPlainText()
+        self.ttsthread = EdgeTtsThread(text)
+        self.ttsthread.finished.connect(self.ttsthread.deleteLater)
+        self.ttsthread.start()
+
+        def play_tts():
+            self.toolButton_9.setEnabled(True)
+            self.player = QMediaPlayer()
+            self.player.setMedia(QMediaContent(QUrl.fromLocalFile(local_ttsmp3_tempfile)))
+            self.player.setVolume(100)
+            self.player.play()
+
+        self.ttsthread.finished.connect(
+            lambda: play_tts()
+        )
+
+
+    def on_toolButton_8_click(self):
         csv_file, filetype = QFileDialog.getSaveFileName(self, '选择保存路径', os.path.join(os.getcwd(), '图片识别结果.csv'),
                                                          "CSV File(*.csv);;All Files(*)")
         if csv_file is None or len(csv_file) <= 3:
@@ -811,7 +845,8 @@ class MainWindow(Ui_MainWindow, QMainWindow):
                 logger.info(f'csvFile = {csvFile}')
                 import csv
                 wr = csv.writer(csvFile, quotechar=',')
-                titles = ['x1 (px)', 'y1 (px)', 'x2 (px)', 'y2 (px)', 'x3 (px)', 'y3 (px)', 'x4 (px)', 'y4 (px)', 'prob.',
+                titles = ['x1 (px)', 'y1 (px)', 'x2 (px)', 'y2 (px)', 'x3 (px)', 'y3 (px)', 'x4 (px)', 'y4 (px)',
+                          'prob.',
                           'text']
                 wr.writerow(titles)
                 for i, box in enumerate(dt_boxes):
@@ -829,7 +864,7 @@ class MainWindow(Ui_MainWindow, QMainWindow):
                                  ])
             QMessageBox.information(self, '保存成功', f'已将识别信息保存到“{csv_file}“', QMessageBox.Ok, QMessageBox.Ok)
 
-    def on_toolButton_8_click(self):
+    def on_toolButton_9_click(self):
         mp3_file, filetype = QFileDialog.getSaveFileName(self, '选择保存路径', os.path.join(os.getcwd(), '图片文字朗读.mp3'),
                                                          "MP3 File(*.mp3);;All Files(*)")
         if mp3_file is None or len(mp3_file) <= 3:
