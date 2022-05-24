@@ -806,7 +806,7 @@ class MainWindow(Ui_MainWindow, QMainWindow):
 
     def on_toolButton_4_click(self):
         self.needread = True
-        self.on_toolButton_2_click(True)
+        self.on_toolButton_3_click(True)
 
     def on_toolButton_5_click(self):
         self.clipboard.setText(self.result.get('text', ""))
