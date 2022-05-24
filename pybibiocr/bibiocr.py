@@ -315,102 +315,64 @@ def get_rotate_crop_image(img, points):
 ########################################################################################################################
 
 
-class Pyttsx3Thread(QThread):
-
-    def __init__(self, txt):
-        super(Pyttsx3Thread, self).__init__()
-        self.txt = txt
-
-    def run(self):
-        import pyttsx3
-        engine = pyttsx3.init(debug=True)
-        volume = engine.getProperty('volume')
-        engine.setProperty('volume', 1.0)
-        engine.say(self.txt)
-        engine.runAndWait()
-        engine.stop()
-
-
-# class Edge_ttsThread(QThread):
-#     def __init__(self, txt=None):
-#         super(Edge_ttsThread, self).__init__()
-#         self.txt = txt
-#
-#     def run(self):
-#         def text_to_mp3(txt, mp3file):
-#             def find_edge_tts(dir=None):
-#                 edge_tts_exe = 'edge-tts.exe'
-#                 if dir is not None:
-#                     edge_tts_path = os.path.join(dir, edge_tts_exe)
-#                     if os.path.exists(edge_tts_path):
-#                         return os.path.abspath(edge_tts_path)
-#                 edge_tts_path = os.path.join('binary', edge_tts_exe)
-#                 if os.path.exists(edge_tts_path):
-#                     return os.path.abspath(edge_tts_path)
-#                 if os.path.exists(edge_tts_exe):
-#                     return os.path.abspath(edge_tts_exe)
-#                 return edge_tts_exe
-#
-#             program = QProcess()
-#             program.start(find_edge_tts(), ['--voice', 'zh-CN-XiaomoNeural', '--text', txt, '--write-media',
-#                                             mp3file])
-#             program.waitForFinished()
-#
-#         if os.path.exists(local_ttsmp3_tempfile):
-#             os.remove(local_ttsmp3_tempfile)
-#         text_to_mp3(self.txt, local_ttsmp3_tempfile)
-#         logger.info(f"Generated {self.txt} into TTS file{local_ttsmp3_tempfile}")
-
-
 class EdgeTtsThread(QThread):
     def __init__(self, txt=''):
         super(EdgeTtsThread, self).__init__()
         self.txt = txt.replace('\n', '')
         self.args = get_args('edge_tts.json')
+        if self.args.write_media:
+            local_ttsmp3_tempfile = get_config_path(self.args.write_media)
 
     def run(self):
         from edge_tts import Communicate, SubMaker, list_voices
         import asyncio
         async def _tts(text, args):
-            tts = Communicate()
-            subs = SubMaker(args.overlapping)
-            if args.write_media:
-                media_file = open(get_config_path(args.write_media), "wb")  # pylint: disable=consider-using-with
-            if args.custom_ssml:
-                args.custom_ssml = get_config_path(args.custom_ssml)
-            async for i in tts.run(
-                    text,
-                    args.boundary_type,
-                    args.codec,
-                    args.voice,
-                    args.pitch,
-                    args.rate,
-                    args.volume,
-                    customspeak=args.custom_ssml,
-            ):
-                if i[2] is not None:
-                    if not args.write_media:
-                        sys.stdout.buffer.write(i[2])
-                    else:
-                        media_file.write(i[2])
-                elif i[0] is not None and i[1] is not None:
-                    subs.create_sub(i[0], i[1])
-            if args.write_media:
-                media_file.close()
-            if not args.write_subtitles:
-                sys.stderr.write(subs.generate_subs())
-            else:
-                with open(get_config_path(args.write_subtitles), "w", encoding="utf-8") as file:
-                    srt = subs.generate_subs()
-                    file.write(srt)
-                    logger.info(f"subtitles: {srt}")
+            try:
+                tts = Communicate()
+                subs = SubMaker(args.overlapping)
+                with open(local_ttsmp3_tempfile, "wb") as media_file:
+                    if args.custom_ssml:
+                        args.custom_ssml = get_config_path(args.custom_ssml)
+                    async for i in tts.run(
+                            text,
+                            args.boundary_type,
+                            args.codec,
+                            args.voice,
+                            args.pitch,
+                            args.rate,
+                            args.volume,
+                            customspeak=args.custom_ssml,
+                    ):
+                        if i[2] is not None:
+                            if not args.write_media:
+                                sys.stdout.buffer.write(i[2])
+                            else:
+                                media_file.write(i[2])
+                        elif i[0] is not None and i[1] is not None:
+                            subs.create_sub(i[0], i[1])
+                if not args.write_subtitles:
+                    sys.stderr.write(subs.generate_subs())
+                else:
+                    with open(get_config_path(args.write_subtitles), "w", encoding="utf-8") as file:
+                        srt = subs.generate_subs()
+                        file.write(srt)
+                        logger.info(f"subtitles: {srt}")
+            except Exception as exp:
+                import traceback
+                traceback.print_exc()
+                exc_type, exc_value, exc_traceback = sys.exc_info()
+                error = str(repr(traceback.format_exception(exc_type, exc_value, exc_traceback)))
+                if os.path.exists(local_ttsmp3_tempfile):
+                    os.remove(local_ttsmp3_tempfile)
+                logger.debug(f"Error:{error}")
 
         if os.path.exists(get_config_path(self.args.write_media)):
             os.remove(get_config_path(self.args.write_media))
         if os.path.exists(get_config_path(self.args.write_subtitles)):
             os.remove(get_config_path(self.args.write_subtitles))
         asyncio.new_event_loop().run_until_complete(_tts(self.txt, self.args))
-        logger.info(f"Generated {self.txt} into TTS file{local_ttsmp3_tempfile}")
+        logger.info(
+            f"Generated {self.txt} into TTS file [{os.path.exists(local_ttsmp3_tempfile)}] {local_ttsmp3_tempfile}")
 
 
 ########################################################################################################################
@@ -577,7 +539,7 @@ class MainWindow(Ui_MainWindow, QMainWindow):
         self.clipboard = QApplication.clipboard()
         self.toolButton_5.setEnabled(False)
         self.toolButton_6.setEnabled(False)
-        self.toolButton_7.setEnabled(False)
+        # self.toolButton_7.setEnabled(False)
         self.toolButton_8.setEnabled(False)
         self.toolButton_9.setEnabled(False)
         self.toolButton_0.clicked.connect(
@@ -750,22 +712,7 @@ class MainWindow(Ui_MainWindow, QMainWindow):
             self.toolButton_8.setEnabled(True)
 
             if self.needread:
-                pure_text = self.result.get('pure_text', '')
-                # self.thread = Pyttsx3Thread(pure_text)
-                self.ttsthread = EdgeTtsThread(pure_text)
-                self.ttsthread.finished.connect(self.ttsthread.deleteLater)
-                self.ttsthread.start()
-
-                def play_tts():
-                    self.toolButton_9.setEnabled(True)
-                    self.player = QMediaPlayer()
-                    self.player.setMedia(QMediaContent(QUrl.fromLocalFile(local_ttsmp3_tempfile)))
-                    self.player.setVolume(100)
-                    self.player.play()
-
-                self.ttsthread.finished.connect(
-                    lambda: play_tts()
-                )
+                self.on_toolButton_7_click()
 
         self.thread.finished.connect(
             lambda: show_result()
@@ -842,18 +789,35 @@ class MainWindow(Ui_MainWindow, QMainWindow):
         QMessageBox.information(self, '拷贝到剪贴板', '已将识别结果文本部分拷贝到剪贴板', QMessageBox.Ok, QMessageBox.Ok)
 
     def on_toolButton_7_click(self):
-        # text = self.textBrowser.document().toPlainText()
         text = self.textEdit.document().toPlainText()
         self.ttsthread = EdgeTtsThread(text)
         self.ttsthread.finished.connect(self.ttsthread.deleteLater)
         self.ttsthread.start()
 
         def play_tts():
-            self.toolButton_9.setEnabled(True)
-            self.player = QMediaPlayer()
-            self.player.setMedia(QMediaContent(QUrl.fromLocalFile(local_ttsmp3_tempfile)))
-            self.player.setVolume(100)
-            self.player.play()
+            if os.path.exists(local_ttsmp3_tempfile):
+                self.toolButton_9.setEnabled(True)
+                self.player = QMediaPlayer()
+                self.player.setMedia(QMediaContent(QUrl.fromLocalFile(local_ttsmp3_tempfile)))
+                self.player.setVolume(100)
+                self.player.play()
+            else:
+                try:
+                    import pyttsx3
+                    engine = pyttsx3.init(debug=False)
+                    # volume = engine.getProperty('volume')
+                    engine.setProperty('volume', 1.0)
+                    engine.say(text)
+                    engine.save_to_file(text, local_ttsmp3_tempfile)
+                    engine.runAndWait()
+                    engine.stop()
+                    engine = None
+                except Exception as exp:
+                    import traceback
+                    traceback.print_exc()
+                    exc_type, exc_value, exc_traceback = sys.exc_info()
+                    error = str(repr(traceback.format_exception(exc_type, exc_value, exc_traceback)))
+                    logger.debug(f"Error:{error}")
 
         self.ttsthread.finished.connect(
             lambda: play_tts()
@@ -893,7 +857,7 @@ class MainWindow(Ui_MainWindow, QMainWindow):
 
     def on_toolButton_9_click(self):
         mp3_file, filetype = QFileDialog.getSaveFileName(self, '选择保存路径', os.path.join(os.getcwd(), '图片文字朗读.mp3'),
-                                                         "MP3 File(*.mp3);;All Files(*)")
+                                                         "MP3 File(*.mp3);All Files(*)")
         if mp3_file is None or len(mp3_file) <= 3:
             QMessageBox.warning(self, '未选择保存路径', '请选择MP3文件保存路径！', QMessageBox.Ok, QMessageBox.Ok)
         else:
