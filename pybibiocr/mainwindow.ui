@@ -63,6 +63,26 @@
        </spacer>
       </item>
       <item>
+       <widget class="QToolButton" name="toolButton_0">
+        <property name="text">
+         <string>截图 Snip</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <spacer name="horizontalSpacer_6">
+        <property name="orientation">
+         <enum>Qt::Horizontal</enum>
+        </property>
+        <property name="sizeHint" stdset="0">
+         <size>
+          <width>40</width>
+          <height>20</height>
+         </size>
+        </property>
+       </spacer>
+      </item>
+      <item>
        <widget class="QToolButton" name="toolButton">
         <property name="text">
          <string>识别剪贴板 Reco.Clipboard</string>
@@ -469,6 +489,7 @@
     <property name="title">
      <string>操作OPR</string>
     </property>
+    <addaction name="action_0"/>
     <addaction name="action"/>
     <addaction name="action_2"/>
     <addaction name="action_3"/>
@@ -490,6 +511,11 @@
    <addaction name="menu_2"/>
   </widget>
   <widget class="QStatusBar" name="statusbar"/>
+  <action name="action_0">
+   <property name="text">
+    <string>截图 Snip</string>
+   </property>
+  </action>
   <action name="action">
    <property name="text">
     <string>识别剪贴板 Reco.Clipboard</string>
@@ -547,6 +573,7 @@
   </action>
  </widget>
  <tabstops>
+  <tabstop>toolButton_0</tabstop>
   <tabstop>toolButton</tabstop>
   <tabstop>toolButton_2</tabstop>
   <tabstop>toolButton_3</tabstop>

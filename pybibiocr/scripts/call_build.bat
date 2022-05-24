@@ -25,7 +25,7 @@ call %pywinDir%\Scripts\pyinstaller.exe --clean -y %pysrcDir%\bibiocr.spec
 call Xcopy /S /I /E /Y %pywinDir%\Lib\site-packages\Shapely.libs %pysrcDir%\dist\%exename%\Shapely.libs
 call Xcopy /S /I /E /Y %pysrcDir%\build\lib.win-amd64-3.7\pybibiocr\mainwindow.pyd %pysrcDir%\dist\%exename%\
 call Xcopy /S /I /E /Y %pysrcDir%\build\lib.win-amd64-3.7\pybibiocr\onnx %pysrcDir%\dist\%exename%\onnx
-call Xcopy /S /I /E /Y %pysrcDir%\binary\screen_snapshot.exe %pysrcDir%\dist\%exename%\
+call Xcopy /S /I /E /Y %pysrcDir%\binary\snip.exe %pysrcDir%\dist\%exename%\
 
 
 

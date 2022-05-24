@@ -580,42 +580,39 @@ class MainWindow(Ui_MainWindow, QMainWindow):
         self.toolButton_7.setEnabled(False)
         self.toolButton_8.setEnabled(False)
         self.toolButton_9.setEnabled(False)
-
+        self.toolButton_0.clicked.connect(
+            self.on_toolButton_0_click
+        )
         self.toolButton.clicked.connect(
             self.on_toolButton_click
         )
         self.toolButton_2.clicked.connect(
             self.on_toolButton_2_click
         )
-
         self.toolButton_3.clicked.connect(
             self.on_toolButton_3_click
         )
-
         self.toolButton_4.clicked.connect(
             self.on_toolButton_4_click
         )
-
         self.toolButton_5.clicked.connect(
             self.on_toolButton_5_click
         )
-
         self.toolButton_6.clicked.connect(
             self.on_toolButton_6_click
         )
-
         self.toolButton_7.clicked.connect(
             self.on_toolButton_7_click
         )
-
         self.toolButton_8.clicked.connect(
             self.on_toolButton_8_click
         )
-
         self.toolButton_9.clicked.connect(
             self.on_toolButton_9_click
         )
-
+        self.action_0.triggered.connect(
+            self.on_toolButton_0_click
+        )
         self.action.triggered.connect(
             self.on_toolButton_click
         )
@@ -774,6 +771,34 @@ class MainWindow(Ui_MainWindow, QMainWindow):
             lambda: show_result()
         )
 
+    def on_toolButton_0_click(self):
+        def find_snip(dir=None):
+            snip_exe = 'snip.exe'
+            if dir is not None:
+                snip_path = os.path.join(dir, snip_exe)
+                if os.path.exists(snip_path):
+                    return os.path.abspath(snip_path)
+            snip_path = os.path.join('binary', snip_exe)
+            if os.path.exists(snip_path):
+                return os.path.abspath(snip_path)
+            if os.path.exists(snip_exe):
+                return os.path.abspath(snip_exe)
+            return snip_exe
+
+        program = QProcess()
+        program.start(find_snip())
+        self.showMinimized()
+        program.waitForFinished()
+        mimedata = self.clipboard.mimeData()
+        if mimedata.hasImage():
+            qimg = self.clipboard.image()
+            pmp = QPixmap(qimg)
+            scene = QGraphicsScene()
+            scene.addItem(QGraphicsPixmapItem(pmp))
+            self.graphicsView.setScene(scene)
+            self.graphicsView.update()
+        self.showNormal()
+
     def on_toolButton_click(self, needread=False):
         self.needread = needread
         mimedata = self.clipboard.mimeData()
@@ -833,7 +858,6 @@ class MainWindow(Ui_MainWindow, QMainWindow):
         self.ttsthread.finished.connect(
             lambda: play_tts()
         )
-
 
     def on_toolButton_8_click(self):
         csv_file, filetype = QFileDialog.getSaveFileName(self, '选择保存路径', os.path.join(os.getcwd(), '图片识别结果.csv'),
