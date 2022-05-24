@@ -721,8 +721,10 @@ class MainWindow(Ui_MainWindow, QMainWindow):
                 self.graphicsView_2.setScene(scene)
                 # self.graphicsView_2.fitInView(scene.sceneRect(), mode=Qt.KeepAspectRatio)
                 self.graphicsView_2.update()
-                self.textBrowser.setText(self.result.get('pure_text', ''))
-                self.textBrowser.show()
+                self.textEdit.setPlainText(self.result.get('pure_text', ''))
+                self.textEdit.show()
+                # self.textBrowser.setText(self.result.get('pure_text', ''))
+                # self.textBrowser.show()
 
             colnames = ['x1 (px)', 'y1 (px)', 'x2 (px)', 'y2 (px)', 'x3 (px)', 'y3 (px)', 'x4 (px)', 'y4 (px)', 'prob.',
                         'text']
@@ -815,7 +817,8 @@ class MainWindow(Ui_MainWindow, QMainWindow):
         QMessageBox.information(self, '拷贝到剪贴板', '已将识别结果文本部分拷贝到剪贴板', QMessageBox.Ok, QMessageBox.Ok)
 
     def on_toolButton_7_click(self):
-        text = self.textBrowser.document().toPlainText()
+        # text = self.textBrowser.document().toPlainText()
+        text = self.textEdit.document().toPlainText()
         self.ttsthread = EdgeTtsThread(text)
         self.ttsthread.finished.connect(self.ttsthread.deleteLater)
         self.ttsthread.start()
