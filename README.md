@@ -9,7 +9,7 @@ BibiOcr is a PyQT5 based windows version offline OCR tool.
 * It supports image text reading with open TTS tool.
 
 ## UI Demo
-![DEMO Image](docs/bibocr_1.2_demo.png)
+![DEMO Image](docs/bibiocr_1.2_demo.png)
 
 # UI Design: Python 3.7 + PyQT5
 
