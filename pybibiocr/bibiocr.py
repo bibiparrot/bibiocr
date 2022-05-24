@@ -795,8 +795,8 @@ class MainWindow(Ui_MainWindow, QMainWindow):
         self.ttsthread.start()
 
         def play_tts():
+            self.toolButton_9.setEnabled(True)
             if os.path.exists(local_ttsmp3_tempfile):
-                self.toolButton_9.setEnabled(True)
                 self.player = QMediaPlayer()
                 self.player.setMedia(QMediaContent(QUrl.fromLocalFile(local_ttsmp3_tempfile)))
                 self.player.setVolume(100)
