@@ -732,9 +732,9 @@ class MainWindow(Ui_MainWindow, QMainWindow):
                 return os.path.abspath(snip_exe)
             return snip_exe
 
+        self.showMinimized()
         program = QProcess()
         program.start(find_snip())
-        self.showMinimized()
         program.waitForFinished()
         mimedata = self.clipboard.mimeData()
         if mimedata.hasImage():
