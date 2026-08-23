@@ -1,12 +1,11 @@
-# Runtime dependencies for bibiocr_pipeline.
-# Single-quoted TOML strings keep Windows backslashes literal.
+# Paths are resolved relative to the installed bibiocr.exe directory.
 
 [dependencies]
-vlm_model = 'D:\bibiocr\PaddleOCR-VL-1.6-GGUF\PaddleOCR-VL-1.6-GGUF.gguf'
-mmproj = 'D:\bibiocr\PaddleOCR-VL-1.6-GGUF\PaddleOCR-VL-1.6-GGUF-mmproj.gguf'
-layout_model = 'D:\bibiocr\PaddlePaddlePP-DocLayoutV3_onnx\inference.onnx'
-ort_dll = 'D:\bibiocr\ORT\runtime\onnxruntime.dll'
-llama_server = 'D:\bibiocr\llama-b10582-bin-win-cpu-x64\llama-server.exe'
+vlm_model = 'runtime\models\PaddleOCR-VL-1.6-GGUF.gguf'
+mmproj = 'runtime\models\PaddleOCR-VL-1.6-GGUF-mmproj.gguf'
+layout_model = 'runtime\layout\inference.onnx'
+ort_dll = 'runtime\onnxruntime\onnxruntime.dll'
+llama_server = 'runtime\llama\llama-server.exe'
 
 [tools]
-pandoc = '..\..\..\pandoc-3.10.2-windows-x86_64\pandoc-3.10.2\pandoc.exe'
+pandoc = 'runtime\pandoc\pandoc.exe'
