@@ -1,0 +1,11 @@
+# Paths are resolved relative to the installed bibiocr.exe directory.
+
+[dependencies]
+vlm_model = 'runtime\models\PaddleOCR-VL-1.6-GGUF.gguf'
+mmproj = 'runtime\models\PaddleOCR-VL-1.6-GGUF-mmproj.gguf'
+layout_model = 'runtime\layout\inference.onnx'
+ort_dll = 'runtime\onnxruntime\onnxruntime.dll'
+llama_server = 'runtime\llama\llama-server.exe'
+
+[tools]
+pandoc = 'runtime\pandoc\pandoc.exe'

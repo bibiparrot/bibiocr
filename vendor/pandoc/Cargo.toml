@@ -1,0 +1,19 @@
+[package]
+name = "pandoc"
+version = "0.8.11"
+edition = "2018"
+authors = [
+  "Oliver Schneider <rust-pandoc61914191@oli-obk.de>",
+  "Felix S. Klock II <pnkfelix@pnkfx.org>",
+  "Chris Krycho <chris@chriskrycho.com>"
+]
+readme = "README.md"
+keywords = ["latex", "markdown"]
+repository = "https://github.com/oli-obk/rust-pandoc"
+documentation = "https://docs.rs/pandoc"
+license = "MIT/Apache-2.0"
+description = "a library API that wraps calls to the pandoc 2.x executable"
+
+[dependencies]
+itertools = "0.12"
+
