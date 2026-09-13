@@ -2,19 +2,19 @@ fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let mut build = cxx_build::bridge("src/ffi.rs");
     build
-        .include("backend/include")
-        .include("backend/third_party/onnxruntime")
+        .include("src/model_runtimes/include")
+        .include("src/model_runtimes/third_party/onnxruntime")
         .flag_if_supported("/std:c++20")
         .flag_if_supported("/permissive-")
         .flag_if_supported("/utf-8")
         .flag_if_supported("-std=c++20");
 
     for source in [
-        "backend/src/bridge.cpp",
-        "backend/src/config.cpp",
-        "backend/src/document_pipeline.cpp",
-        "backend/src/document_result.cpp",
-        "backend/src/layout_analyzer.cpp",
+        "src/model_runtimes/src/bridge.cpp",
+        "src/model_runtimes/src/config.cpp",
+        "src/model_runtimes/src/document_pipeline.cpp",
+        "src/model_runtimes/src/document_result.cpp",
+        "src/model_runtimes/src/layout_analyzer.cpp",
     ] {
         build.file(source);
     }
@@ -35,6 +35,6 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed=src/ffi.rs");
-    println!("cargo:rerun-if-changed=backend/include");
-    println!("cargo:rerun-if-changed=backend/src");
+    println!("cargo:rerun-if-changed=src/model_runtimes/include");
+    println!("cargo:rerun-if-changed=src/model_runtimes/src");
 }

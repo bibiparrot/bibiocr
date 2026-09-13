@@ -143,7 +143,8 @@ mod tests {
     #[ignore = "loads the real ONNX and GGUF models"]
     fn bridge_pipeline_smoke() {
         let image = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("backend")
+            .join("src")
+            .join("model_runtimes")
             .join("testdata")
             .join("demo1.png");
         let receiver = start_pipeline(image);

@@ -357,7 +357,7 @@ mod tests {
 
     #[test]
     fn writes_docx_with_configured_pandoc_when_available() {
-        let pandoc_path = crate::backend::pandoc_path().ok().or_else(|| {
+        let pandoc_path = crate::model_runtimes::pandoc_path().ok().or_else(|| {
             let repository_parent = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent()?;
             let candidate = repository_parent
                 .join("pandoc-3.10.2-windows-x86_64")

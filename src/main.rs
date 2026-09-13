@@ -3,7 +3,6 @@
 rust_i18n::i18n!("locales", fallback = "en");
 
 mod app;
-mod backend;
 mod batch;
 mod dependencies;
 mod download;
@@ -11,6 +10,7 @@ mod export;
 mod ffi;
 mod html_preview;
 mod locale;
+mod model_runtimes;
 mod settings;
 
 use app::BibiOcrApp;

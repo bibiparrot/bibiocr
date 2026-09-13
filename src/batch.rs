@@ -1,4 +1,4 @@
-use crate::{backend, dependencies::RuntimeConfig, export};
+use crate::{dependencies::RuntimeConfig, export, model_runtimes};
 use eframe::egui::{self, Color32, ProgressBar, RichText};
 use pdf_inspector::vision::{PdfiumRenderer, RenderOptions, RenderPixelFormat};
 use std::{
@@ -235,7 +235,7 @@ fn is_image(path: &Path) -> bool {
 
 fn process_file(path: &Path, output_dir: &Path, config: &RuntimeConfig) -> Result<PathBuf, String> {
     let (markdown, search_dirs) = if is_image(path) {
-        let result = backend::process_image(path)?;
+        let result = model_runtimes::process_image(path)?;
         (result.markdown, vec![result.output_dir])
     } else {
         match anydoc::to_markdown(path) {
@@ -308,7 +308,7 @@ fn process_pdf_with_ocr(
             .ok_or_else(|| "Invalid PDF page bitmap".to_owned())?;
         let image_path = temp.join(format!("page-{}.png", page.page()));
         image.save(&image_path).map_err(|error| error.to_string())?;
-        let result = backend::process_image(&image_path)?;
+        let result = model_runtimes::process_image(&image_path)?;
         recognized.insert(page.page(), result.markdown);
         search_dirs.push(result.output_dir);
         let _ = fs::remove_file(image_path);

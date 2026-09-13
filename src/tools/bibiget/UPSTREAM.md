@@ -1,4 +1,4 @@
-# Vendored bibiget
+# Bundled bibiget
 
 Source: `D:\bibi\bibiget`, commit `b270780f651351fb1da61de05bb2a049a4c60f5e`.
 

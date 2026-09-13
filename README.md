@@ -30,10 +30,11 @@ Open **Batch Processing**, choose separate input and output folders, then start 
 Model files are downloaded with the official
 [`hf-hub`](https://github.com/huggingface/hf-hub) Rust client. Choose
 `https://huggingface.co` or the China mirror `https://hf-mirror.com` in the UI
-(equivalent to `HF_ENDPOINT=https://hf-mirror.com`). HTTP(S) proxy, retry count,
-progress and resumable downloads are supported.
+(equivalent to `HF_ENDPOINT=https://hf-mirror.com`). HTTP(S)/SOCKS proxy, retry count,
+progress and resumable downloads are supported. Proxy, HF mirror, and GitHub
+acceleration can each be enabled or disabled independently.
 
-GitHub release assets are downloaded by the vendored `bibiget` 0.1.1 library
+GitHub release assets are downloaded by the bundled `bibiget` 0.1.1 library
 with eight parallel connections, resumable checkpoints, proxy support, and GUI progress events.
 
 For GitHub release assets, leave acceleration blank for direct GitHub access or

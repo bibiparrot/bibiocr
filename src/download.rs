@@ -2,10 +2,8 @@ use crate::{
     dependencies::{self, DependencyKey},
     settings,
 };
-use futures::StreamExt;
 use std::{
-    fs::{self, OpenOptions},
-    io::Write,
+    fs,
     path::{Path, PathBuf},
     process::Command,
     sync::mpsc::{self, Receiver, Sender},
@@ -33,14 +31,8 @@ pub enum DownloadEvent {
 
 #[derive(Clone, Copy)]
 enum PackageKind {
-    HuggingFace {
-        owner: &'static str,
-        repository: &'static str,
-        filename: &'static str,
-    },
-    Archive {
-        executable: &'static str,
-    },
+    HuggingFace,
+    Archive { executable: &'static str },
 }
 
 #[derive(Clone)]
@@ -87,33 +79,33 @@ fn packages(options: &DownloadOptions) -> Result<Vec<Package>, String> {
     let mut result = vec![
         Package {
             key: DependencyKey::VlmModel,
-            url: String::new(),
+            url: hugging_face_url(
+                &options.hf_endpoint,
+                "PaddlePaddle/PaddleOCR-VL-1.6-GGUF",
+                "PaddleOCR-VL-1.6-GGUF.gguf",
+            ),
             destination: defaults.path(DependencyKey::VlmModel).to_path_buf(),
-            kind: PackageKind::HuggingFace {
-                owner: "PaddlePaddle",
-                repository: "PaddleOCR-VL-1.6-GGUF",
-                filename: "PaddleOCR-VL-1.6-GGUF.gguf",
-            },
+            kind: PackageKind::HuggingFace,
         },
         Package {
             key: DependencyKey::Mmproj,
-            url: String::new(),
+            url: hugging_face_url(
+                &options.hf_endpoint,
+                "PaddlePaddle/PaddleOCR-VL-1.6-GGUF",
+                "PaddleOCR-VL-1.6-GGUF-mmproj.gguf",
+            ),
             destination: defaults.path(DependencyKey::Mmproj).to_path_buf(),
-            kind: PackageKind::HuggingFace {
-                owner: "PaddlePaddle",
-                repository: "PaddleOCR-VL-1.6-GGUF",
-                filename: "PaddleOCR-VL-1.6-GGUF-mmproj.gguf",
-            },
+            kind: PackageKind::HuggingFace,
         },
         Package {
             key: DependencyKey::LayoutModel,
-            url: String::new(),
+            url: hugging_face_url(
+                &options.hf_endpoint,
+                "PaddlePaddle/PP-DocLayoutV3_onnx",
+                "inference.onnx",
+            ),
             destination: defaults.path(DependencyKey::LayoutModel).to_path_buf(),
-            kind: PackageKind::HuggingFace {
-                owner: "PaddlePaddle",
-                repository: "PP-DocLayoutV3_onnx",
-                filename: "inference.onnx",
-            },
+            kind: PackageKind::HuggingFace,
         },
     ];
 
@@ -206,12 +198,8 @@ fn install(
     sender: &Sender<DownloadEvent>,
 ) -> Result<PathBuf, String> {
     match package.kind {
-        PackageKind::HuggingFace {
-            owner,
-            repository,
-            filename,
-        } => {
-            download_hugging_face(package, owner, repository, filename, options, sender)?;
+        PackageKind::HuggingFace => {
+            download_file(package, &package.destination, options, sender)?;
             Ok(package.destination.clone())
         }
         PackageKind::Archive { executable } => {
@@ -243,125 +231,6 @@ fn install(
             Ok(installed)
         }
     }
-}
-
-fn download_hugging_face(
-    package: &Package,
-    owner: &str,
-    repository: &str,
-    filename: &str,
-    options: &DownloadOptions,
-    sender: &Sender<DownloadEvent>,
-) -> Result<(), String> {
-    if package.destination.is_file()
-        && package
-            .destination
-            .metadata()
-            .is_ok_and(|metadata| metadata.len() > 0)
-    {
-        let size = package
-            .destination
-            .metadata()
-            .map(|value| value.len())
-            .unwrap_or(0);
-        let _ = sender.send(DownloadEvent::Progress(package.key, size, Some(size)));
-        return Ok(());
-    }
-    if let Some(parent) = package.destination.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("Cannot create {}: {error}", parent.display()))?;
-    }
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| error.to_string())?;
-    runtime.block_on(async {
-        let mut http = reqwest::Client::builder();
-        http = http.user_agent(concat!("bibiocr/", env!("CARGO_PKG_VERSION")));
-        if !options.proxy.trim().is_empty() {
-            http = http.proxy(
-                reqwest::Proxy::all(options.proxy.trim())
-                    .map_err(|error| format!("Invalid proxy: {error}"))?,
-            );
-        }
-        let client = hf_hub::HFClient::builder()
-            .endpoint(options.hf_endpoint.trim_end_matches('/'))
-            .cache_dir(settings::runtime_directory().join("hf-cache"))
-            .retry_max_attempts(options.retries as usize)
-            .client(http.build().map_err(|error| error.to_string())?)
-            .build()
-            .map_err(|error| error.to_string())?;
-        let repo = client.model(owner, repository);
-        let metadata = repo
-            .get_file_metadata()
-            .filepath(filename)
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        let partial = package.destination.with_extension(format!(
-            "{}part",
-            package
-                .destination
-                .extension()
-                .and_then(|value| value.to_str())
-                .map(|value| format!("{value}."))
-                .unwrap_or_default()
-        ));
-        let mut offset = if options.resume {
-            partial.metadata().map(|value| value.len()).unwrap_or(0)
-        } else {
-            0
-        };
-        if offset > metadata.file_size {
-            fs::remove_file(&partial).map_err(|error| error.to_string())?;
-            offset = 0;
-        }
-        if offset == metadata.file_size && offset > 0 {
-            fs::rename(&partial, &package.destination).map_err(|error| error.to_string())?;
-            let _ = sender.send(DownloadEvent::Progress(
-                package.key,
-                offset,
-                Some(metadata.file_size),
-            ));
-            return Ok(());
-        }
-        let builder = repo.download_file_stream().filename(filename);
-        let (_, mut stream) = if offset > 0 {
-            builder
-                .range(offset..metadata.file_size)
-                .send()
-                .await
-                .map_err(|error| error.to_string())?
-        } else {
-            builder.send().await.map_err(|error| error.to_string())?
-        };
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .append(offset > 0)
-            .truncate(offset == 0)
-            .open(&partial)
-            .map_err(|error| error.to_string())?;
-        let mut downloaded = offset;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| error.to_string())?;
-            file.write_all(&chunk).map_err(|error| error.to_string())?;
-            downloaded += chunk.len() as u64;
-            let _ = sender.send(DownloadEvent::Progress(
-                package.key,
-                downloaded,
-                Some(metadata.file_size),
-            ));
-        }
-        file.flush().map_err(|error| error.to_string())?;
-        if downloaded != metadata.file_size {
-            return Err(format!(
-                "Incomplete response: received {downloaded} of {} bytes",
-                metadata.file_size
-            ));
-        }
-        fs::rename(&partial, &package.destination).map_err(|error| error.to_string())
-    })
 }
 
 fn download_file(
@@ -435,6 +304,13 @@ fn github_url(template: &str, url: &str) -> String {
     format!("{}/{url}", template.trim_end_matches('/'))
 }
 
+fn hugging_face_url(endpoint: &str, repository: &str, filename: &str) -> String {
+    format!(
+        "{}/{repository}/resolve/main/{filename}",
+        endpoint.trim_end_matches('/')
+    )
+}
+
 fn find_file(root: &Path, filename: &str) -> Option<PathBuf> {
     let entries = fs::read_dir(root).ok()?;
     for entry in entries.flatten() {
@@ -469,7 +345,7 @@ fn make_executable(_path: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::github_url;
+    use super::{github_url, hugging_face_url};
 
     #[test]
     fn github_proxy_supports_documented_template_and_prefix_forms() {
@@ -483,5 +359,17 @@ mod tests {
             format!("https://gh-proxy.com/{url}")
         );
         assert_eq!(github_url("", url), url);
+    }
+
+    #[test]
+    fn hugging_face_url_supports_mirror_endpoint() {
+        assert_eq!(
+            hugging_face_url(
+                "https://hf-mirror.com/",
+                "PaddlePaddle/PP-DocLayoutV3_onnx",
+                "inference.onnx"
+            ),
+            "https://hf-mirror.com/PaddlePaddle/PP-DocLayoutV3_onnx/resolve/main/inference.onnx"
+        );
     }
 }

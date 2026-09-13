@@ -1,10 +1,10 @@
 use crate::{
-    backend::{self, BackendEvent},
     batch::BatchPanel,
     dependencies::{DependencyKey, RuntimeConfig},
     download::{self, DownloadEvent, DownloadOptions},
     export, html_preview,
     locale::{LocaleManager, SUPPORTED_LOCALES},
+    model_runtimes::{self, BackendEvent},
     settings::AppSettings,
 };
 use arboard::Clipboard;
@@ -135,7 +135,7 @@ impl BibiOcrApp {
         egui_extras::install_image_loaders(&cc.egui_ctx);
         configure_style(&cc.egui_ctx);
         install_cjk_font(&cc.egui_ctx);
-        let availability = backend::availability();
+        let availability = model_runtimes::availability();
         let runtime_config = RuntimeConfig::load();
         let downloads_open = !runtime_config.missing().is_empty();
         Self {
@@ -251,7 +251,7 @@ impl BibiOcrApp {
         }
         self.progress = 0.02;
         self.status = rust_i18n::t!("starting").into_owned();
-        self.pipeline = Some(backend::start_pipeline(path));
+        self.pipeline = Some(model_runtimes::start_pipeline(path));
     }
 
     fn poll_pipeline(&mut self, ctx: &egui::Context) {
@@ -358,7 +358,7 @@ impl BibiOcrApp {
             return Ok(());
         };
         let search_dirs = self.image_search_dirs();
-        let pandoc = backend::pandoc_path()?;
+        let pandoc = model_runtimes::pandoc_path()?;
         export::save_docx(&path, &self.workspace.markdown, &search_dirs, &pandoc)?;
         self.status = rust_i18n::t!("saved", path = path.display()).into_owned();
         Ok(())
@@ -427,9 +427,21 @@ impl BibiOcrApp {
         self.downloads = Some(download::start(
             keys,
             DownloadOptions {
-                proxy: self.settings.proxy.clone(),
-                hf_endpoint: self.settings.hf_endpoint.clone(),
-                github_proxy: self.settings.github_proxy.clone(),
+                proxy: self
+                    .settings
+                    .use_proxy
+                    .then(|| self.settings.proxy.clone())
+                    .unwrap_or_default(),
+                hf_endpoint: if self.settings.use_hf_mirror {
+                    self.settings.hf_endpoint.clone()
+                } else {
+                    "https://huggingface.co".to_owned()
+                },
+                github_proxy: self
+                    .settings
+                    .use_github_proxy
+                    .then(|| self.settings.github_proxy.clone())
+                    .unwrap_or_default(),
                 resume: self.settings.resume_downloads,
                 retries: self.settings.download_retries,
             },
@@ -479,7 +491,7 @@ impl BibiOcrApp {
     }
 
     fn refresh_backend(&mut self) {
-        let availability = backend::availability();
+        let availability = model_runtimes::availability();
         self.backend_available = availability.is_ok();
         self.status = availability
             .map(|_| rust_i18n::t!("ready").into_owned())
@@ -727,22 +739,34 @@ impl BibiOcrApp {
                 ui.label(rust_i18n::t!("dependencies_intro"));
                 ui.separator();
                 ui.horizontal(|ui| {
+                    ui.checkbox(
+                        &mut self.settings.use_hf_mirror,
+                        rust_i18n::t!("use_hf_mirror"),
+                    );
                     ui.label(rust_i18n::t!("hf_endpoint"));
-                    ui.text_edit_singleline(&mut self.settings.hf_endpoint);
-                    if ui.button("HF").clicked() {
-                        self.settings.hf_endpoint = "https://huggingface.co".to_owned();
-                    }
-                    if ui.button("HF Mirror").clicked() {
-                        self.settings.hf_endpoint = "https://hf-mirror.com".to_owned();
-                    }
+                    ui.add_enabled_ui(self.settings.use_hf_mirror, |ui| {
+                        ui.text_edit_singleline(&mut self.settings.hf_endpoint);
+                        if ui.button("HF Mirror").clicked() {
+                            self.settings.hf_endpoint = "https://hf-mirror.com".to_owned();
+                        }
+                    });
                 });
                 ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.settings.use_proxy, rust_i18n::t!("use_proxy"));
                     ui.label(rust_i18n::t!("proxy"));
-                    ui.text_edit_singleline(&mut self.settings.proxy);
+                    ui.add_enabled_ui(self.settings.use_proxy, |ui| {
+                        ui.text_edit_singleline(&mut self.settings.proxy);
+                    });
                 });
                 ui.horizontal(|ui| {
+                    ui.checkbox(
+                        &mut self.settings.use_github_proxy,
+                        rust_i18n::t!("use_github_proxy"),
+                    );
                     ui.label(rust_i18n::t!("github_proxy"));
-                    ui.text_edit_singleline(&mut self.settings.github_proxy);
+                    ui.add_enabled_ui(self.settings.use_github_proxy, |ui| {
+                        ui.text_edit_singleline(&mut self.settings.github_proxy);
+                    });
                 });
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.settings.resume_downloads, rust_i18n::t!("resume"));
@@ -1248,7 +1272,7 @@ mod tests {
         backend_event_is_terminal, clipboard_rgba, guard_operation, save_target_for,
         translate_markdown_placeholder, validate_image_dimensions,
     };
-    use crate::backend::{BackendEvent, PipelineOutput};
+    use crate::model_runtimes::{BackendEvent, PipelineOutput};
     use std::path::Path;
 
     #[test]

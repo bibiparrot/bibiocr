@@ -8,8 +8,11 @@ pub struct AppSettings {
     /// supported rust-i18n locale code.
     pub locale: String,
     pub last_input_dir: Option<PathBuf>,
+    pub use_proxy: bool,
     pub proxy: String,
+    pub use_hf_mirror: bool,
     pub hf_endpoint: String,
+    pub use_github_proxy: bool,
     pub github_proxy: String,
     pub resume_downloads: bool,
     pub download_retries: u32,
@@ -18,11 +21,14 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         let chinese = sys_locale::get_locale().is_some_and(|value| value.starts_with("zh"));
+        let hf_endpoint = std::env::var("HF_ENDPOINT").ok();
         Self {
             locale: "system".to_owned(),
             last_input_dir: None,
+            use_proxy: false,
             proxy: String::new(),
-            hf_endpoint: std::env::var("HF_ENDPOINT").unwrap_or_else(|_| {
+            use_hf_mirror: hf_endpoint.is_some() || chinese,
+            hf_endpoint: hf_endpoint.unwrap_or_else(|| {
                 if chinese {
                     "https://hf-mirror.com"
                 } else {
@@ -30,6 +36,7 @@ impl Default for AppSettings {
                 }
                 .to_owned()
             }),
+            use_github_proxy: chinese,
             github_proxy: if chinese {
                 "https://gh-proxy.com/${giturl}".to_owned()
             } else {
