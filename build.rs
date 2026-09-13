@@ -9,22 +9,17 @@ fn main() {
         .flag_if_supported("/utf-8")
         .flag_if_supported("-std=c++20");
 
-    if target_os == "windows" {
-        for source in [
-            "backend/src/bridge.cpp",
-            "backend/src/config.cpp",
-            "backend/src/document_pipeline.cpp",
-            "backend/src/document_result.cpp",
-            "backend/src/layout_analyzer.cpp",
-            "backend/src/llama_cpp.cpp",
-        ] {
-            build.file(source);
-        }
-        for library in ["windowscodecs", "ole32", "winhttp", "ws2_32", "gdiplus"] {
-            println!("cargo:rustc-link-lib={library}");
-        }
-    } else {
-        build.file("backend/src/bridge_stub.cpp");
+    for source in [
+        "backend/src/bridge.cpp",
+        "backend/src/config.cpp",
+        "backend/src/document_pipeline.cpp",
+        "backend/src/document_result.cpp",
+        "backend/src/layout_analyzer.cpp",
+    ] {
+        build.file(source);
+    }
+    if target_os == "linux" {
+        println!("cargo:rustc-link-lib=dl");
     }
     build.compile("bibiocr_backend");
 

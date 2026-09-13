@@ -1,7 +1,5 @@
 #include "bibiocr/config.hpp"
 
-#include <Windows.h>
-
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -96,17 +94,6 @@ std::filesystem::path utf8_path(const std::string& value) {
         std::u8string(reinterpret_cast<const char8_t*>(value.data()), value.size()));
 }
 
-std::filesystem::path executable_directory() {
-    std::wstring buffer(32768, L'\0');
-    const DWORD length = GetModuleFileNameW(nullptr, buffer.data(),
-                                            static_cast<DWORD>(buffer.size()));
-    if (length == 0 || length >= buffer.size()) {
-        throw std::runtime_error("cannot determine executable directory");
-    }
-    buffer.resize(length);
-    return std::filesystem::path(buffer).parent_path();
-}
-
 std::filesystem::path resolve_path(const std::filesystem::path& runtime_directory,
                                    const std::string& value) {
     std::filesystem::path result = utf8_path(value);
@@ -190,7 +177,8 @@ AppConfig load_config(const std::filesystem::path& config_path) {
             throw std::runtime_error("bibiocr.toml is missing dependencies." + key);
         }
     }
-    const std::filesystem::path runtime_directory = executable_directory();
+    const std::filesystem::path runtime_directory =
+        std::filesystem::absolute(config_path).parent_path();
     AppConfig config{
         resolve_path(runtime_directory, values.at("vlm_model")),
         resolve_path(runtime_directory, values.at("mmproj")),

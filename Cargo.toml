@@ -1,6 +1,6 @@
 [package]
 name = "bibiocr"
-version = "2.1.0"
+version = "2.2.0"
 edition = "2024"
 description = "A cross-platform OCR desktop utility built with egui"
 license = "MIT"
@@ -8,20 +8,27 @@ build = "build.rs"
 
 [dependencies]
 arboard = "3.6"
+base64 = "0.22"
 cxx = "1.0"
 eframe = { version = "0.36.1", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
 egui_commonmark = { version = "0.25.0", default-features = false, features = ["load-images", "pulldown_cmark"] }
 egui_dock = "0.21.1"
 egui_extras = { version = "0.36.1", features = ["all_loaders"] }
+futures = "0.3"
+hf-hub = { git = "https://github.com/huggingface/hf-hub.git", rev = "194cfbd673b8be116950b277a2248f17375524db", default-features = false, features = ["rustls-tls"] }
 image = { version = "0.25.8", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
 pandoc = "0.8.11"
 rfd = "0.15.4"
 pulldown-cmark = "0.13.4"
 regex = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 rust-i18n = "4"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sys-locale = "0.3.2"
 toml = "0.9"
+tokio = { version = "1", features = ["net", "rt", "time"] }
+ureq = "3.4"
 
 [build-dependencies]
 cxx-build = "1.0"
@@ -36,26 +43,3 @@ pandoc = { path = "vendor/pandoc" }
 lto = "thin"
 opt-level = 3
 strip = true
-
-[package.metadata.packager]
-before-packaging-command = "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-package.ps1"
-product-name = "BIBIOCR"
-identifier = "com.bibiocr.desktop"
-publisher = "BIBIOCR"
-copyright = "Copyright © 2026 BIBIOCR contributors"
-category = "Productivity"
-formats = ["wix"]
-out-dir = "target/packages"
-binaries-dir = "target/release"
-icons = ["assets/bibiocr.ico"]
-resources = [
-    { src = "target/package-staging/bibiocr.toml", target = "bibiocr.toml" },
-    { src = "target/package-staging/runtime", target = "runtime" },
-]
-
-[[package.metadata.packager.binaries]]
-path = "bibiocr"
-main = true
-
-[package.metadata.packager.wix]
-template = "packaging/main.wxs"

@@ -1,0 +1,146 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag
+        required: true
+        default: v2.2.0
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/bibiocr.exe dist/bibiocr-windows-x86_64.exe
+          Compress-Archive target/release/bibiocr.exe dist/bibiocr-windows-x86_64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: dist/*
+
+  macos:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15-intel
+            arch: x86_64
+          - runner: macos-latest
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - shell: bash
+        run: |
+          set -euxo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if [[ "$GITHUB_REF_TYPE" != tag ]]; then version="${{ inputs.release_tag }}"; version="${version#v}"; fi
+          app=dist/BIBIOCR.app
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp target/release/bibiocr "$app/Contents/MacOS/bibiocr"
+          cat > "$app/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleExecutable</key><string>bibiocr</string>
+            <key>CFBundleIdentifier</key><string>com.bibiocr.desktop</string>
+            <key>CFBundleName</key><string>BIBIOCR</string>
+            <key>CFBundleShortVersionString</key><string>${version}</string>
+          </dict></plist>
+          EOF
+          ditto -c -k --keepParent "$app" "dist/bibiocr-${version}-${{ matrix.arch }}-macOS.zip"
+          pkgbuild --component "$app" --install-location /Applications "dist/bibiocr-${version}-${{ matrix.arch }}-macOS.pkg"
+          hdiutil create -volname BIBIOCR -srcfolder "$app" -ov -format UDZO "dist/bibiocr-${version}-${{ matrix.arch }}.dmg"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macOS-${{ matrix.arch }}
+          path: |
+            dist/*.zip
+            dist/*.pkg
+            dist/*.dmg
+
+  linux:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+            appimage_arch: x86_64
+            deb_arch: amd64
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+            appimage_arch: aarch64
+            deb_arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev libasound2-dev rpm
+      - run: cargo build --release
+      - shell: bash
+        run: |
+          set -euxo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if [[ "$GITHUB_REF_TYPE" != tag ]]; then version="${{ inputs.release_tag }}"; version="${version#v}"; fi
+          mkdir -p dist deb/DEBIAN deb/usr/bin rpm/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          install -m755 target/release/bibiocr deb/usr/bin/bibiocr
+          printf 'Package: bibiocr\nVersion: %s\nArchitecture: %s\nMaintainer: BIBIOCR contributors\nDescription: Offline OCR desktop application\n' "$version" '${{ matrix.deb_arch }}' > deb/DEBIAN/control
+          dpkg-deb --build --root-owner-group deb "dist/bibiocr_${version}_${{ matrix.arch }}.deb"
+          cp target/release/bibiocr rpm/SOURCES/bibiocr
+          cat > rpm/SPECS/bibiocr.spec <<EOF
+          Name: bibiocr
+          Version: ${version}
+          Release: 1
+          Summary: Offline OCR desktop application
+          License: MIT
+          %description
+          BIBIOCR offline OCR desktop application.
+          %install
+          mkdir -p %{buildroot}/usr/bin
+          install -m755 %{_sourcedir}/bibiocr %{buildroot}/usr/bin/bibiocr
+          %files
+          /usr/bin/bibiocr
+          EOF
+          rpmbuild --define "_topdir $PWD/rpm" --target '${{ matrix.arch }}' -bb rpm/SPECS/bibiocr.spec
+          cp rpm/RPMS/*/*.rpm "dist/bibiocr-${version}_${{ matrix.arch }}.rpm"
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/256x256/apps
+          install -m755 target/release/bibiocr AppDir/usr/bin/bibiocr
+          cp assets/bibiocr-logo.png AppDir/bibiocr.png
+          cp assets/bibiocr-logo.png AppDir/usr/share/icons/hicolor/256x256/apps/bibiocr.png
+          printf '[Desktop Entry]\nType=Application\nName=BIBIOCR\nExec=bibiocr\nIcon=bibiocr\nCategories=Office;Graphics;\n' > AppDir/bibiocr.desktop
+          printf '#!/bin/sh\nexec "$APPDIR/usr/bin/bibiocr" "$@"\n' > AppDir/AppRun
+          chmod +x AppDir/AppRun
+          curl -L -o appimagetool "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${{ matrix.appimage_arch }}.AppImage"
+          chmod +x appimagetool
+          ARCH='${{ matrix.appimage_arch }}' ./appimagetool --appimage-extract-and-run AppDir "dist/bibiocr-${version}_${{ matrix.arch }}.AppImage"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/*
+
+  release:
+    needs: [windows, macos, linux]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+          generate_release_notes: true
+          files: artifacts/*

@@ -1,10 +1,5 @@
 #include "bibiocr/document_pipeline.hpp"
-
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <Windows.h>
-#include <gdiplus.h>
+#include "bibiocr/src/ffi.rs.h"
 
 #include <algorithm>
 #include <cmath>
@@ -15,42 +10,10 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace bibiocr {
 namespace {
-
-class GdiplusSession {
-public:
-    GdiplusSession() {
-        Gdiplus::GdiplusStartupInput input;
-        if (Gdiplus::GdiplusStartup(&token_, &input, nullptr) != Gdiplus::Ok) {
-            throw std::runtime_error("cannot initialize image output support");
-        }
-    }
-    ~GdiplusSession() { Gdiplus::GdiplusShutdown(token_); }
-
-private:
-    ULONG_PTR token_{};
-};
-
-CLSID encoder_clsid(const wchar_t* mime_type) {
-    UINT count = 0;
-    UINT bytes = 0;
-    if (Gdiplus::GetImageEncodersSize(&count, &bytes) != Gdiplus::Ok || bytes == 0) {
-        throw std::runtime_error("cannot enumerate image encoders");
-    }
-    std::vector<std::byte> storage(bytes);
-    auto* encoders = reinterpret_cast<Gdiplus::ImageCodecInfo*>(storage.data());
-    if (Gdiplus::GetImageEncoders(count, bytes, encoders) != Gdiplus::Ok) {
-        throw std::runtime_error("cannot read image encoders");
-    }
-    for (UINT index = 0; index < count; ++index) {
-        if (std::wstring_view(encoders[index].MimeType) == mime_type) {
-            return encoders[index].Clsid;
-        }
-    }
-    throw std::runtime_error("required image encoder is unavailable");
-}
 
 std::string path_utf8(const std::filesystem::path& path) {
     const std::u8string value = path.u8string();
@@ -166,112 +129,56 @@ void write_json(const DocumentResult& result, const std::filesystem::path& path)
     if (!output) throw std::runtime_error("cannot write result JSON");
 }
 
-std::wstring widen_ascii(std::string_view value) {
-    return {value.begin(), value.end()};
-}
-
-std::wstring image_filename(const LayoutBlock& block) {
-    return L"img_in_" + widen_ascii(block.label) + L"_box_" +
-           std::to_wstring(coordinate(block.left)) + L"_" +
-           std::to_wstring(coordinate(block.top)) + L"_" +
-           std::to_wstring(coordinate(block.right)) + L"_" +
-           std::to_wstring(coordinate(block.bottom)) + L".jpg";
-}
-
-bool is_image_block(const LayoutBlock& block) {
-    return block.label == "image" || block.label == "figure" || block.label == "seal";
+std::filesystem::path utf8_path(const std::string& value) {
+    return std::filesystem::path(
+        reinterpret_cast<const char8_t*>(value.data()),
+        reinterpret_cast<const char8_t*>(value.data() + value.size()));
 }
 
 void save_images(const DocumentResult& result, const std::filesystem::path& save_path) {
-    GdiplusSession session;
-    Gdiplus::Bitmap source(result.input_path.c_str());
-    if (source.GetLastStatus() != Gdiplus::Ok) {
-        throw std::runtime_error("cannot load input image for result artifacts");
-    }
-    const CLSID png = encoder_clsid(L"image/png");
-    const CLSID jpeg = encoder_clsid(L"image/jpeg");
-
-    Gdiplus::Bitmap overlay(result.input_path.c_str());
-    if (overlay.GetLastStatus() != Gdiplus::Ok) {
-        throw std::runtime_error("cannot create layout visualization");
-    }
-    Gdiplus::Graphics graphics(&overlay);
-    graphics.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
-    Gdiplus::FontFamily family(L"Arial");
-    Gdiplus::Font font(&family, 12.0F, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+    std::vector<ArtifactBlock> blocks;
     for (const LayoutBlock& block : result.layout_blocks) {
-        const BYTE red = static_cast<BYTE>(40 + (block.class_id * 71) % 190);
-        const BYTE green = static_cast<BYTE>(40 + (block.class_id * 47) % 190);
-        const BYTE blue = static_cast<BYTE>(40 + (block.class_id * 29) % 190);
-        Gdiplus::Pen pen(Gdiplus::Color(255, red, green, blue), 2.0F);
-        const Gdiplus::RectF rectangle(
-            block.left, block.top, block.right - block.left, block.bottom - block.top);
-        graphics.DrawRectangle(&pen, rectangle);
-        std::wostringstream label;
-        label << widen_ascii(block.label) << L" " << std::fixed << std::setprecision(2)
-              << block.score;
-        Gdiplus::SolidBrush background(Gdiplus::Color(190, 255, 255, 255));
-        const Gdiplus::RectF label_box(block.left, std::max(0.0F, block.top - 15.0F),
-                                      180.0F, 15.0F);
-        graphics.FillRectangle(&background, label_box);
-        Gdiplus::SolidBrush text(Gdiplus::Color(255, red, green, blue));
-        graphics.DrawString(label.str().c_str(), -1, &font,
-                            Gdiplus::PointF(label_box.X, label_box.Y), &text);
+        ArtifactBlock artifact;
+        artifact.class_id = block.class_id;
+        artifact.label = block.label;
+        artifact.left = block.left;
+        artifact.top = block.top;
+        artifact.right = block.right;
+        artifact.bottom = block.bottom;
+        blocks.push_back(std::move(artifact));
     }
-    const std::filesystem::path overlay_path =
-        save_path / (result.input_path.stem().wstring() + L"_layout_det_res.png");
-    if (overlay.Save(overlay_path.c_str(), &png, nullptr) != Gdiplus::Ok) {
-        throw std::runtime_error("cannot save layout visualization");
-    }
-
-    const std::filesystem::path image_directory = save_path / L"imgs";
-    for (const LayoutBlock& block : result.layout_blocks) {
-        if (!is_image_block(block)) continue;
-        const int left = std::clamp(coordinate(block.left), 0,
-                                    static_cast<int>(source.GetWidth()));
-        const int top = std::clamp(coordinate(block.top), 0,
-                                   static_cast<int>(source.GetHeight()));
-        const int right = std::clamp(coordinate(block.right), 0,
-                                     static_cast<int>(source.GetWidth()));
-        const int bottom = std::clamp(coordinate(block.bottom), 0,
-                                      static_cast<int>(source.GetHeight()));
-        if (right <= left || bottom <= top) continue;
-        const Gdiplus::Rect crop_rectangle(left, top, right - left, bottom - top);
-        std::unique_ptr<Gdiplus::Bitmap> crop(
-            source.Clone(crop_rectangle, source.GetPixelFormat()));
-        if (!crop || crop->GetLastStatus() != Gdiplus::Ok ||
-            crop->Save((image_directory / image_filename(block)).c_str(), &jpeg, nullptr) !=
-                Gdiplus::Ok) {
-            throw std::runtime_error("cannot save extracted image block");
-        }
-    }
+    save_image_artifacts(
+        rust::Str(path_utf8(result.input_path)), rust::Str(path_utf8(save_path)),
+        rust::Str(path_utf8(result.input_path.stem())),
+        rust::Slice<const ArtifactBlock>(blocks.data(), blocks.size()));
 }
 
 }  // namespace
 
 void DocumentResult::save_all(const std::filesystem::path& save_path) const {
     std::error_code error;
-    const std::filesystem::path image_directory = save_path / L"imgs";
+    const std::filesystem::path image_directory = save_path / "imgs";
     std::filesystem::create_directories(image_directory, error);
     if (error) throw std::runtime_error("cannot create result directory");
     for (const auto& entry : std::filesystem::directory_iterator(image_directory)) {
-        const std::wstring filename = entry.path().filename().wstring();
-        if (entry.is_regular_file() && filename.starts_with(L"img_in_") &&
-            entry.path().extension() == L".jpg") {
+        const std::string filename = path_utf8(entry.path().filename());
+        if (entry.is_regular_file() && filename.starts_with("img_in_") &&
+            entry.path().extension() == ".jpg") {
             std::filesystem::remove(entry.path(), error);
             if (error) throw std::runtime_error("cannot replace prior image artifacts");
         }
     }
 
-    const std::filesystem::path markdown_path =
-        save_path / (input_path.stem().wstring() + L".md");
+    const std::filesystem::path markdown_path = save_path / utf8_path(
+        path_utf8(input_path.stem()) + ".md");
     std::ofstream markdown_output(markdown_path, std::ios::binary | std::ios::trunc);
     if (!markdown_output) throw std::runtime_error("cannot create Markdown output file");
     markdown_output.write(markdown.data(), static_cast<std::streamsize>(markdown.size()));
     if (!markdown_output) throw std::runtime_error("cannot write Markdown output file");
     markdown_output.close();
 
-    write_json(*this, save_path / (input_path.stem().wstring() + L"_res.json"));
+    write_json(*this, save_path / utf8_path(
+        path_utf8(input_path.stem()) + "_res.json"));
     save_images(*this, save_path);
 }
 

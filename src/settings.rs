@@ -8,13 +8,35 @@ pub struct AppSettings {
     /// supported rust-i18n locale code.
     pub locale: String,
     pub last_input_dir: Option<PathBuf>,
+    pub proxy: String,
+    pub hf_endpoint: String,
+    pub github_proxy: String,
+    pub resume_downloads: bool,
+    pub download_retries: u32,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
+        let chinese = sys_locale::get_locale().is_some_and(|value| value.starts_with("zh"));
         Self {
             locale: "system".to_owned(),
             last_input_dir: None,
+            proxy: String::new(),
+            hf_endpoint: std::env::var("HF_ENDPOINT").unwrap_or_else(|_| {
+                if chinese {
+                    "https://hf-mirror.com"
+                } else {
+                    "https://huggingface.co"
+                }
+                .to_owned()
+            }),
+            github_proxy: if chinese {
+                "https://gh-proxy.com/${giturl}".to_owned()
+            } else {
+                String::new()
+            },
+            resume_downloads: true,
+            download_retries: 3,
         }
     }
 }
@@ -44,6 +66,16 @@ pub fn settings_path() -> PathBuf {
     std::env::var_os("BIBIOCR_SETTINGS")
         .map(PathBuf::from)
         .unwrap_or_else(|| default_settings_dir().join("settings.toml"))
+}
+
+pub fn runtime_config_path() -> PathBuf {
+    std::env::var_os("BIBIOCR_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_settings_dir().join("bibiocr.toml"))
+}
+
+pub fn runtime_directory() -> PathBuf {
+    default_settings_dir().join("runtime")
 }
 
 fn default_settings_dir() -> PathBuf {

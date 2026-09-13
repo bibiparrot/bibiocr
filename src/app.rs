@@ -1,5 +1,7 @@
 use crate::{
     backend::{self, BackendEvent},
+    dependencies::{DependencyKey, RuntimeConfig},
+    download::{self, DownloadEvent, DownloadOptions},
     export, html_preview,
     locale::{LocaleManager, SUPPORTED_LOCALES},
     settings::AppSettings,
@@ -107,12 +109,17 @@ pub struct BibiOcrApp {
     dock_state: DockState<WorkspaceTab>,
     maximized: Option<WorkspaceTab>,
     pipeline: Option<Receiver<BackendEvent>>,
+    downloads: Option<Receiver<DownloadEvent>>,
+    download_current: Option<DependencyKey>,
+    download_progress: (u64, Option<u64>),
     progress: f32,
     status: String,
     backend_available: bool,
     about_open: bool,
+    downloads_open: bool,
     failure_dialog: Option<String>,
     settings: AppSettings,
+    runtime_config: RuntimeConfig,
     locale: LocaleManager,
 }
 
@@ -124,11 +131,16 @@ impl BibiOcrApp {
         configure_style(&cc.egui_ctx);
         install_cjk_font(&cc.egui_ctx);
         let availability = backend::availability();
+        let runtime_config = RuntimeConfig::load();
+        let downloads_open = !runtime_config.missing().is_empty();
         Self {
             workspace: Workspace::default(),
             dock_state: default_dock_state(),
             maximized: None,
             pipeline: None,
+            downloads: None,
+            download_current: None,
+            download_progress: (0, None),
             progress: 0.0,
             status: availability
                 .as_ref()
@@ -136,8 +148,10 @@ impl BibiOcrApp {
                 .unwrap_or_else(|error| error.clone()),
             backend_available: availability.is_ok(),
             about_open: false,
+            downloads_open,
             failure_dialog: None,
             settings,
+            runtime_config,
             locale,
         }
     }
@@ -382,6 +396,91 @@ impl BibiOcrApp {
         self.failure_dialog = Some(error);
     }
 
+    fn browse_dependency(&mut self, key: DependencyKey) {
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(parent) = self.runtime_config.path(key).parent() {
+            dialog = dialog.set_directory(parent);
+        }
+        if let Some(path) = dialog.pick_file() {
+            self.runtime_config.set_path(key, path);
+            if let Err(error) = self.runtime_config.save() {
+                self.fail(error);
+            } else {
+                self.refresh_backend();
+            }
+        }
+    }
+
+    fn start_downloads(&mut self, keys: Vec<DependencyKey>) {
+        if self.downloads.is_some() || keys.is_empty() {
+            return;
+        }
+        if let Err(error) = self.settings.save() {
+            self.fail(error);
+            return;
+        }
+        self.downloads = Some(download::start(
+            keys,
+            DownloadOptions {
+                proxy: self.settings.proxy.clone(),
+                hf_endpoint: self.settings.hf_endpoint.clone(),
+                github_proxy: self.settings.github_proxy.clone(),
+                resume: self.settings.resume_downloads,
+                retries: self.settings.download_retries,
+            },
+        ));
+    }
+
+    fn poll_downloads(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = self.downloads.take() else {
+            return;
+        };
+        let mut keep = true;
+        loop {
+            match receiver.try_recv() {
+                Ok(DownloadEvent::Started(key)) => {
+                    self.download_current = Some(key);
+                    self.download_progress = (0, None);
+                }
+                Ok(DownloadEvent::Progress(key, downloaded, total)) => {
+                    self.download_current = Some(key);
+                    self.download_progress = (downloaded, total);
+                }
+                Ok(DownloadEvent::Complete(key, path)) => {
+                    self.runtime_config.set_path(key, path);
+                    if let Err(error) = self.runtime_config.save() {
+                        self.fail(error);
+                    }
+                }
+                Ok(DownloadEvent::Failed(key, error)) => {
+                    self.download_current = Some(key);
+                    self.fail(error);
+                    keep = false;
+                    break;
+                }
+                Ok(DownloadEvent::Finished) | Err(TryRecvError::Disconnected) => {
+                    self.download_current = None;
+                    self.refresh_backend();
+                    keep = false;
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
+            }
+        }
+        if keep {
+            self.downloads = Some(receiver);
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+    }
+
+    fn refresh_backend(&mut self) {
+        let availability = backend::availability();
+        self.backend_available = availability.is_ok();
+        self.status = availability
+            .map(|_| rust_i18n::t!("ready").into_owned())
+            .unwrap_or_else(|error| error);
+    }
+
     fn title_and_toolbar(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         // `horizontal_centered` expands to all remaining vertical space in egui.
         // This header must stay at its intrinsic toolbar height so it cannot hide
@@ -400,6 +499,15 @@ impl BibiOcrApp {
                     .clicked()
                 {
                     self.about_open = true;
+                }
+                if ui
+                    .add_sized(
+                        [130.0, 28.0],
+                        egui::Button::new(rust_i18n::t!("dependencies")),
+                    )
+                    .clicked()
+                {
+                    self.downloads_open = true;
                 }
                 if ui
                     .add_sized(
@@ -600,6 +708,115 @@ impl BibiOcrApp {
             self.failure_dialog = None;
         }
     }
+
+    fn downloads_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.downloads_open;
+        let mut browse = None;
+        let mut download_keys = None;
+        egui::Window::new(rust_i18n::t!("dependencies_title"))
+            .open(&mut open)
+            .resizable(true)
+            .default_size([820.0, 620.0])
+            .show(ctx, |ui| {
+                ui.label(rust_i18n::t!("dependencies_intro"));
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(rust_i18n::t!("hf_endpoint"));
+                    ui.text_edit_singleline(&mut self.settings.hf_endpoint);
+                    if ui.button("HF").clicked() {
+                        self.settings.hf_endpoint = "https://huggingface.co".to_owned();
+                    }
+                    if ui.button("HF Mirror").clicked() {
+                        self.settings.hf_endpoint = "https://hf-mirror.com".to_owned();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(rust_i18n::t!("proxy"));
+                    ui.text_edit_singleline(&mut self.settings.proxy);
+                });
+                ui.horizontal(|ui| {
+                    ui.label(rust_i18n::t!("github_proxy"));
+                    ui.text_edit_singleline(&mut self.settings.github_proxy);
+                });
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.settings.resume_downloads, rust_i18n::t!("resume"));
+                    ui.label(rust_i18n::t!("retries"));
+                    ui.add(egui::DragValue::new(&mut self.settings.download_retries).range(0..=10));
+                });
+                ui.small(rust_i18n::t!("github_proxy_hint"));
+                ui.separator();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for key in DependencyKey::ALL {
+                        ui.group(|ui| {
+                            ui.horizontal(|ui| {
+                                let installed = self.runtime_config.path(key).is_file();
+                                ui.colored_label(
+                                    if installed { GREEN } else { Color32::DARK_RED },
+                                    if installed { "●" } else { "○" },
+                                );
+                                ui.strong(key.name());
+                                ui.label(self.runtime_config.path(key).display().to_string());
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if ui
+                                        .add_enabled(
+                                            self.downloads.is_none(),
+                                            egui::Button::new(rust_i18n::t!("download")),
+                                        )
+                                        .clicked()
+                                    {
+                                        download_keys = Some(vec![key]);
+                                    }
+                                    if ui.button(rust_i18n::t!("browse")).clicked() {
+                                        browse = Some(key);
+                                    }
+                                });
+                            });
+                        });
+                    }
+                });
+                if let Some(key) = self.download_current {
+                    let (downloaded, total) = self.download_progress;
+                    let ratio = total
+                        .filter(|value| *value > 0)
+                        .map(|value| downloaded as f32 / value as f32)
+                        .unwrap_or(0.0);
+                    ui.add(ProgressBar::new(ratio).show_percentage().text(format!(
+                            "{}: {:.1} MiB{}",
+                            key.name(),
+                            downloaded as f64 / 1_048_576.0,
+                            total
+                                .map(|value| format!(" / {:.1} MiB", value as f64 / 1_048_576.0))
+                                .unwrap_or_default()
+                        )));
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            self.downloads.is_none(),
+                            egui::Button::new(rust_i18n::t!("download_missing")),
+                        )
+                        .clicked()
+                    {
+                        download_keys = Some(self.runtime_config.missing());
+                    }
+                    if ui.button(rust_i18n::t!("save_configuration")).clicked()
+                        && let Err(error) = self
+                            .runtime_config
+                            .save()
+                            .and_then(|_| self.settings.save())
+                    {
+                        self.fail(error);
+                    }
+                });
+            });
+        self.downloads_open = open;
+        if let Some(key) = browse {
+            self.browse_dependency(key);
+        }
+        if let Some(keys) = download_keys {
+            self.start_downloads(keys);
+        }
+    }
 }
 
 impl eframe::App for BibiOcrApp {
@@ -620,6 +837,7 @@ impl eframe::App for BibiOcrApp {
 impl BibiOcrApp {
     fn frame_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.poll_pipeline(ctx);
+        self.poll_downloads(ctx);
         self.handle_drop(ctx);
 
         egui::Panel::top("top-toolbar")
@@ -647,6 +865,9 @@ impl BibiOcrApp {
             .show(ui, |ui| self.workspace_ui(ui));
         if self.about_open {
             self.about_window(ctx);
+        }
+        if self.downloads_open {
+            self.downloads_window(ctx);
         }
         self.failure_window(ctx);
     }

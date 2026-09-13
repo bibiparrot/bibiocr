@@ -1,12 +1,16 @@
 #include "bibiocr/layout_analyzer.hpp"
 
 #include "onnxruntime_c_api.h"
+#include "bibiocr/src/ffi.rs.h"
 
+#ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <Windows.h>
-#include <wincodec.h>
+#else
+#include <dlfcn.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -25,8 +29,8 @@
 namespace bibiocr {
 namespace {
 
-constexpr UINT kModelWidth = 800;
-constexpr UINT kModelHeight = 800;
+constexpr std::uint32_t kModelWidth = 800;
+constexpr std::uint32_t kModelHeight = 800;
 
 const std::array<const char*, 25> kLabels = {
     "abstract", "algorithm", "aside_text", "chart", "content",
@@ -52,130 +56,62 @@ const std::unordered_set<std::string> kVisualLabels = {
 
 const std::unordered_set<int> kLargeCategoryIds = {3, 5, 6, 15, 17};
 
-template <typename T>
-struct ComReleaser {
-    void operator()(T* value) const noexcept {
-        if (value != nullptr) {
-            value->Release();
-        }
-    }
-};
-
-template <typename T>
-using ComPtr = std::unique_ptr<T, ComReleaser<T>>;
-
-void check_hresult(HRESULT result, const char* operation) {
-    if (FAILED(result)) {
-        throw std::runtime_error(std::string(operation) + " failed (HRESULT " +
-                                 std::to_string(static_cast<unsigned long>(result)) + ")");
-    }
-}
-
-class ComApartment {
-public:
-    ComApartment() {
-        const HRESULT result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        if (result == RPC_E_CHANGED_MODE) {
-            return;
-        }
-        check_hresult(result, "CoInitializeEx");
-        initialized_ = true;
-    }
-
-    ~ComApartment() {
-        if (initialized_) {
-            CoUninitialize();
-        }
-    }
-
-private:
-    bool initialized_ = false;
-};
-
 struct ImageTensor {
-    UINT original_width{};
-    UINT original_height{};
+    std::uint32_t original_width{};
+    std::uint32_t original_height{};
     std::vector<float> nchw;
 };
 
-ImageTensor load_image_tensor(const std::filesystem::path& path) {
-    ComApartment apartment;
-
-    IWICImagingFactory* factory_raw = nullptr;
-    check_hresult(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-                                   IID_PPV_ARGS(&factory_raw)),
-                  "create WIC factory");
-    ComPtr<IWICImagingFactory> factory(factory_raw);
-
-    IWICBitmapDecoder* decoder_raw = nullptr;
-    check_hresult(factory->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
-                                                     WICDecodeMetadataCacheOnLoad,
-                                                     &decoder_raw),
-                  "decode input image");
-    ComPtr<IWICBitmapDecoder> decoder(decoder_raw);
-
-    IWICBitmapFrameDecode* frame_raw = nullptr;
-    check_hresult(decoder->GetFrame(0, &frame_raw), "read input image frame");
-    ComPtr<IWICBitmapFrameDecode> frame(frame_raw);
-
-    ImageTensor result;
-    check_hresult(frame->GetSize(&result.original_width, &result.original_height),
-                  "read input image dimensions");
-    if (result.original_width == 0 || result.original_height == 0) {
-        throw std::runtime_error("input image has invalid dimensions");
-    }
-
-    IWICBitmapScaler* scaler_raw = nullptr;
-    check_hresult(factory->CreateBitmapScaler(&scaler_raw), "create image scaler");
-    ComPtr<IWICBitmapScaler> scaler(scaler_raw);
-    check_hresult(scaler->Initialize(frame.get(), kModelWidth, kModelHeight,
-                                     WICBitmapInterpolationModeCubic),
-                  "resize input image");
-
-    IWICFormatConverter* converter_raw = nullptr;
-    check_hresult(factory->CreateFormatConverter(&converter_raw), "create format converter");
-    ComPtr<IWICFormatConverter> converter(converter_raw);
-    check_hresult(converter->Initialize(scaler.get(), GUID_WICPixelFormat32bppRGBA,
-                                        WICBitmapDitherTypeNone, nullptr, 0.0,
-                                        WICBitmapPaletteTypeCustom),
-                  "convert input image to RGB");
-
-    constexpr UINT stride = kModelWidth * 4;
-    std::vector<std::uint8_t> rgba(static_cast<std::size_t>(stride) * kModelHeight);
-    check_hresult(converter->CopyPixels(nullptr, stride, static_cast<UINT>(rgba.size()),
-                                        rgba.data()),
-                  "copy resized image pixels");
-
-    const std::size_t plane_size = static_cast<std::size_t>(kModelWidth) * kModelHeight;
-    result.nchw.resize(plane_size * 3);
-    for (std::size_t pixel = 0; pixel < plane_size; ++pixel) {
-        const std::size_t source = pixel * 4;
-        result.nchw[pixel] = static_cast<float>(rgba[source]) / 255.0F;
-        result.nchw[plane_size + pixel] = static_cast<float>(rgba[source + 1]) / 255.0F;
-        result.nchw[2 * plane_size + pixel] =
-            static_cast<float>(rgba[source + 2]) / 255.0F;
-    }
-    return result;
+std::string path_utf8(const std::filesystem::path& path) {
+    const std::u8string value = path.u8string();
+    return {reinterpret_cast<const char*>(value.data()), value.size()};
 }
+
+ImageTensor load_image(const std::filesystem::path& path) {
+    const std::string value = path_utf8(path);
+    ImageTensorResponse image = bibiocr::load_image_tensor(rust::Str(value));
+    return {image.width, image.height,
+            std::vector<float>(image.nchw.begin(), image.nchw.end())};
+}
+
+#ifdef _WIN32
+using LibraryHandle = HMODULE;
+LibraryHandle open_library(const std::filesystem::path& path) {
+    return LoadLibraryW(path.c_str());
+}
+void* load_symbol(LibraryHandle library, const char* name) {
+    return reinterpret_cast<void*>(GetProcAddress(library, name));
+}
+void close_library(LibraryHandle library) { FreeLibrary(library); }
+#else
+using LibraryHandle = void*;
+LibraryHandle open_library(const std::filesystem::path& path) {
+    return dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+}
+void* load_symbol(LibraryHandle library, const char* name) {
+    return dlsym(library, name);
+}
+void close_library(LibraryHandle library) { dlclose(library); }
+#endif
 
 class OrtRuntime {
 public:
     explicit OrtRuntime(const std::filesystem::path& dll_path) {
-        module_ = LoadLibraryW(dll_path.c_str());
+        module_ = open_library(dll_path);
         if (module_ == nullptr) {
             throw std::runtime_error("cannot load ONNX Runtime DLL");
         }
         using GetApiBase = const OrtApiBase*(ORT_API_CALL*)();
         const auto get_api_base = reinterpret_cast<GetApiBase>(
-            GetProcAddress(module_, "OrtGetApiBase"));
+            load_symbol(module_, "OrtGetApiBase"));
         if (get_api_base == nullptr) {
-            FreeLibrary(module_);
+            close_library(module_);
             module_ = nullptr;
             throw std::runtime_error("ONNX Runtime DLL does not export OrtGetApiBase");
         }
         api_ = get_api_base()->GetApi(ORT_API_VERSION);
         if (api_ == nullptr) {
-            FreeLibrary(module_);
+            close_library(module_);
             module_ = nullptr;
             throw std::runtime_error("ONNX Runtime API version is incompatible");
         }
@@ -186,7 +122,7 @@ public:
 
     ~OrtRuntime() {
         if (module_ != nullptr) {
-            FreeLibrary(module_);
+            close_library(module_);
         }
     }
 
@@ -202,7 +138,7 @@ public:
     }
 
 private:
-    HMODULE module_ = nullptr;
+    LibraryHandle module_ = nullptr;
     const OrtApi* api_ = nullptr;
 };
 
@@ -513,7 +449,7 @@ LayoutAnalysis LayoutAnalyzer::analyze_document(
     if (!std::filesystem::is_regular_file(image_path)) {
         throw std::runtime_error("input image does not exist");
     }
-    const ImageTensor image = load_image_tensor(image_path);
+    const ImageTensor image = load_image(image_path);
     const OrtRuntime runtime(runtime_dll_);
     LayoutAnalysis result;
     result.width = static_cast<int>(image.original_width);

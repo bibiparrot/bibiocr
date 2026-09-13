@@ -1,17 +1,12 @@
 #include "bibiocr/document_pipeline.hpp"
-
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <Windows.h>
-#include <wincodec.h>
+#include "bibiocr/src/ffi.rs.h"
 
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <cmath>
 #include <cstddef>
-#include <memory>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -22,122 +17,25 @@
 namespace bibiocr {
 namespace {
 
-template <typename T>
-struct ComReleaser {
-    void operator()(T* value) const noexcept {
-        if (value != nullptr) {
-            value->Release();
-        }
-    }
-};
-
-template <typename T>
-using ComPtr = std::unique_ptr<T, ComReleaser<T>>;
-
-void check_hresult(HRESULT result, const char* operation) {
-    if (FAILED(result)) {
-        throw std::runtime_error(std::string(operation) + " failed");
-    }
-}
-
-class ComApartment {
-public:
-    ComApartment() {
-        const HRESULT result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        if (result != RPC_E_CHANGED_MODE) {
-            check_hresult(result, "CoInitializeEx");
-            initialized_ = true;
-        }
-    }
-    ~ComApartment() {
-        if (initialized_) {
-            CoUninitialize();
-        }
-    }
-
-private:
-    bool initialized_ = false;
-};
-
 class ImageCropEncoder {
 public:
     explicit ImageCropEncoder(const std::filesystem::path& path) {
-        IWICImagingFactory* factory_raw = nullptr;
-        check_hresult(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-                                       IID_PPV_ARGS(&factory_raw)),
-                      "create WIC factory");
-        factory_.reset(factory_raw);
-
-        IWICBitmapDecoder* decoder_raw = nullptr;
-        check_hresult(factory_->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
-                                                          WICDecodeMetadataCacheOnLoad,
-                                                          &decoder_raw),
-                      "decode input image");
-        decoder_.reset(decoder_raw);
-
-        IWICBitmapFrameDecode* frame_raw = nullptr;
-        check_hresult(decoder_->GetFrame(0, &frame_raw), "read input image frame");
-        frame_.reset(frame_raw);
+        const std::u8string value = path.u8string();
+        path_.assign(reinterpret_cast<const char*>(value.data()), value.size());
     }
 
     std::vector<std::byte> crop_png(const LayoutBlock& block) const {
         const int left = static_cast<int>(std::floor(block.left));
         const int top = static_cast<int>(std::floor(block.top));
-        const int width = static_cast<int>(std::ceil(block.right)) - left;
-        const int height = static_cast<int>(std::ceil(block.bottom)) - top;
-        if (width <= 0 || height <= 0) {
-            throw std::runtime_error("layout block has invalid dimensions");
-        }
-
-        IWICBitmapClipper* clipper_raw = nullptr;
-        check_hresult(factory_->CreateBitmapClipper(&clipper_raw), "create region cropper");
-        ComPtr<IWICBitmapClipper> clipper(clipper_raw);
-        const WICRect rectangle{left, top, width, height};
-        check_hresult(clipper->Initialize(frame_.get(), &rectangle), "crop layout region");
-
-        IStream* stream_raw = nullptr;
-        check_hresult(CreateStreamOnHGlobal(nullptr, TRUE, &stream_raw),
-                      "create PNG memory stream");
-        ComPtr<IStream> stream(stream_raw);
-
-        IWICBitmapEncoder* encoder_raw = nullptr;
-        check_hresult(factory_->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder_raw),
-                      "create PNG encoder");
-        ComPtr<IWICBitmapEncoder> encoder(encoder_raw);
-        check_hresult(encoder->Initialize(stream.get(), WICBitmapEncoderNoCache),
-                      "initialize PNG encoder");
-
-        IWICBitmapFrameEncode* encoded_frame_raw = nullptr;
-        IPropertyBag2* properties_raw = nullptr;
-        check_hresult(encoder->CreateNewFrame(&encoded_frame_raw, &properties_raw),
-                      "create PNG frame");
-        ComPtr<IWICBitmapFrameEncode> encoded_frame(encoded_frame_raw);
-        ComPtr<IPropertyBag2> properties(properties_raw);
-        check_hresult(encoded_frame->Initialize(properties.get()), "initialize PNG frame");
-        check_hresult(encoded_frame->SetSize(static_cast<UINT>(width),
-                                             static_cast<UINT>(height)),
-                      "size PNG frame");
-        check_hresult(encoded_frame->WriteSource(clipper.get(), nullptr), "encode PNG crop");
-        check_hresult(encoded_frame->Commit(), "commit PNG frame");
-        check_hresult(encoder->Commit(), "commit PNG image");
-
-        HGLOBAL memory = nullptr;
-        check_hresult(GetHGlobalFromStream(stream.get(), &memory), "read PNG memory stream");
-        const SIZE_T size = GlobalSize(memory);
-        const void* data = GlobalLock(memory);
-        if (data == nullptr || size == 0) {
-            throw std::runtime_error("PNG crop encoding returned no data");
-        }
-        const auto* begin = static_cast<const std::byte*>(data);
-        std::vector<std::byte> png(begin, begin + size);
-        GlobalUnlock(memory);
-        return png;
+        const rust::Vec<std::uint8_t> png = encode_png_crop(
+            rust::Str(path_), left, top, static_cast<int>(std::ceil(block.right)),
+            static_cast<int>(std::ceil(block.bottom)));
+        const auto* begin = reinterpret_cast<const std::byte*>(png.data());
+        return {begin, begin + png.size()};
     }
 
 private:
-    ComPtr<IWICImagingFactory> factory_;
-    ComPtr<IWICBitmapDecoder> decoder_;
-    ComPtr<IWICBitmapFrameDecode> frame_;
+    std::string path_;
 };
 
 std::string_view prompt_for_label(std::string_view label) {
@@ -313,7 +211,6 @@ DocumentResult DocumentPipeline::process(const std::filesystem::path& image_path
         throw std::runtime_error("DocLayoutV3 found no document content");
     }
 
-    ComApartment apartment;
     const ImageCropEncoder image(image_path);
     DocumentResult result;
     result.input_path = std::filesystem::absolute(image_path);
