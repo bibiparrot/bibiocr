@@ -10,6 +10,7 @@ build = "build.rs"
 arboard = "3.6"
 anydoc = "0.2.4"
 base64 = "0.22"
+bibiget = { path = "vendor/bibiget" }
 cxx = "1.0"
 eframe = { version = "0.36.1", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
 egui_commonmark = { version = "0.25.0", default-features = false, features = ["load-images", "pulldown_cmark"] }

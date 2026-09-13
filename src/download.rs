@@ -5,7 +5,7 @@ use crate::{
 use futures::StreamExt;
 use std::{
     fs::{self, OpenOptions},
-    io::{Read, Write},
+    io::Write,
     path::{Path, PathBuf},
     process::Command,
     sync::mpsc::{self, Receiver, Sender},
@@ -383,92 +383,42 @@ fn download_file(
         fs::create_dir_all(parent)
             .map_err(|error| format!("Cannot create {}: {error}", parent.display()))?;
     }
-    let partial = destination.with_extension(format!(
-        "{}part",
-        destination
-            .extension()
-            .and_then(|value| value.to_str())
-            .map(|value| format!("{value}."))
-            .unwrap_or_default()
-    ));
-    let mut last_error = String::new();
-    for attempt in 0..=options.retries {
-        match download_attempt(package, destination, &partial, options, sender) {
-            Ok(()) => return Ok(()),
-            Err(error) => last_error = error,
+    if destination.is_file() {
+        fs::remove_file(destination).map_err(|error| error.to_string())?;
+    }
+    let (progress_sender, progress_receiver) = mpsc::channel();
+    let events = sender.clone();
+    let key = package.key;
+    let progress = thread::spawn(move || {
+        while let Ok((downloaded, total)) = progress_receiver.recv() {
+            let _ = events.send(DownloadEvent::Progress(key, downloaded, Some(total)));
         }
-        if attempt < options.retries {
-            thread::sleep(Duration::from_secs(1_u64 << attempt.min(5)));
-        }
-    }
-    Err(format!(
-        "Download failed after {} attempts: {last_error}",
-        options.retries + 1
-    ))
-}
-
-fn download_attempt(
-    package: &Package,
-    destination: &Path,
-    partial: &Path,
-    options: &DownloadOptions,
-    sender: &Sender<DownloadEvent>,
-) -> Result<(), String> {
-    let offset = if options.resume {
-        partial.metadata().map(|value| value.len()).unwrap_or(0)
-    } else {
-        0
-    };
-    let mut builder = ureq::Agent::config_builder().timeout_global(None);
-    if !options.proxy.trim().is_empty() {
-        let proxy = ureq::Proxy::new(options.proxy.trim())
-            .map_err(|error| format!("Invalid proxy: {error}"))?;
-        builder = builder.proxy(Some(proxy));
-    }
-    let agent: ureq::Agent = builder.build().into();
-    let mut request = agent.get(&package.url);
-    if offset > 0 {
-        request = request.header("Range", &format!("bytes={offset}-"));
-    }
-    let mut response = request.call().map_err(|error| error.to_string())?;
-    let resumed = offset > 0 && response.status().as_u16() == 206;
-    let downloaded = if resumed { offset } else { 0 };
-    let total = response
-        .body()
-        .content_length()
-        .map(|length| length + downloaded);
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(resumed)
-        .truncate(!resumed)
-        .open(partial)
-        .map_err(|error| format!("Cannot open {}: {error}", partial.display()))?;
-    let mut reader = response.body_mut().as_reader();
-    let mut current = downloaded;
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    loop {
-        let count = reader
-            .read(&mut buffer)
-            .map_err(|error| error.to_string())?;
-        if count == 0 {
-            break;
-        }
-        file.write_all(&buffer[..count])
-            .map_err(|error| error.to_string())?;
-        current += count as u64;
-        let _ = sender.send(DownloadEvent::Progress(package.key, current, total));
-    }
-    file.flush().map_err(|error| error.to_string())?;
-    if let Some(total) = total
-        && current != total
-    {
-        return Err(format!(
-            "Incomplete response: received {current} of {total} bytes"
-        ));
-    }
-    fs::rename(partial, destination)
-        .map_err(|error| format!("Cannot finish {}: {error}", destination.display()))
+    });
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    let result = runtime.block_on(bibiget::download(bibiget::DownloadOptions {
+        urls: vec![reqwest::Url::parse(&package.url).map_err(|error| error.to_string())?],
+        output: Some(destination.to_path_buf()),
+        max_speed: 0,
+        num_connections: 8,
+        headers: reqwest::header::HeaderMap::new(),
+        user_agent: concat!("bibiocr/", env!("CARGO_PKG_VERSION")).to_owned(),
+        no_proxy: false,
+        quiet: true,
+        verbose: 0,
+        alternate: false,
+        timeout: Duration::from_secs(60),
+        chunk_size: 4 * 1024 * 1024,
+        request_size: None,
+        retries: options.retries.max(1) as usize,
+        resume: options.resume,
+        proxy: (!options.proxy.trim().is_empty()).then(|| options.proxy.trim().to_owned()),
+        progress_events: Some(progress_sender),
+    }));
+    let _ = progress.join();
+    result.map(|_| ()).map_err(|error| error.to_string())
 }
 
 fn github_url(template: &str, url: &str) -> String {

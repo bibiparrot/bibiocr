@@ -33,6 +33,9 @@ Model files are downloaded with the official
 (equivalent to `HF_ENDPOINT=https://hf-mirror.com`). HTTP(S) proxy, retry count,
 progress and resumable downloads are supported.
 
+GitHub release assets are downloaded by the vendored `bibiget` 0.1.1 library
+with eight parallel connections, resumable checkpoints, proxy support, and GUI progress events.
+
 For GitHub release assets, leave acceleration blank for direct GitHub access or
 use a template such as `https://gh-proxy.com/${giturl}`. `${giturl}` is replaced
 with the original GitHub URL.
