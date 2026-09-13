@@ -8,6 +8,7 @@ build = "build.rs"
 
 [dependencies]
 arboard = "3.6"
+anydoc = "0.2.4"
 base64 = "0.22"
 cxx = "1.0"
 eframe = { version = "0.36.1", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
@@ -18,6 +19,7 @@ futures = "0.3"
 hf-hub = { git = "https://github.com/huggingface/hf-hub.git", rev = "194cfbd673b8be116950b277a2248f17375524db", default-features = false, features = ["rustls-tls"] }
 image = { version = "0.25.8", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
 pandoc = "0.8.11"
+pdf-inspector = { version = "1.19.0", default-features = false, features = ["render-pdfium"] }
 rfd = "0.15.4"
 pulldown-cmark = "0.13.4"
 regex = "1"

@@ -117,7 +117,7 @@ fn packages(options: &DownloadOptions) -> Result<Vec<Package>, String> {
         },
     ];
 
-    let (ort, llama, pandoc) = platform_archives()?;
+    let (ort, llama, pandoc, pdfium) = platform_archives()?;
     for (key, url, folder, expected) in [
         (
             DependencyKey::OrtDll,
@@ -145,6 +145,12 @@ fn packages(options: &DownloadOptions) -> Result<Vec<Package>, String> {
                 "pandoc"
             },
         ),
+        (
+            DependencyKey::Pdfium,
+            pdfium,
+            "pdfium",
+            dependencies::pdfium_library_name(),
+        ),
     ] {
         result.push(Package {
             key,
@@ -158,32 +164,37 @@ fn packages(options: &DownloadOptions) -> Result<Vec<Package>, String> {
     Ok(result)
 }
 
-fn platform_archives() -> Result<(&'static str, &'static str, &'static str), String> {
+fn platform_archives() -> Result<(&'static str, &'static str, &'static str, &'static str), String> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("windows", "x86_64") => Ok((
             "https://github.com/microsoft/onnxruntime/releases/download/v1.28.1/onnxruntime-win-x64-1.28.1.zip",
             "https://github.com/ggml-org/llama.cpp/releases/download/b10603/llama-b10603-bin-win-cpu-x64.zip",
             "https://github.com/jgm/pandoc/releases/download/3.10.2/pandoc-3.10.2-windows-x86_64.zip",
+            "https://github.com/firecrawl/pdfium-rs/releases/download/native-v7988/firecrawl-pdfium-win-x64.tgz",
         )),
         ("macos", "x86_64") => Ok((
             "https://github.com/microsoft/onnxruntime/releases/download/v1.28.1/onnxruntime-osx-x86_64-1.28.1.tgz",
             "https://github.com/ggml-org/llama.cpp/releases/download/b10603/llama-b10603-bin-macos-x64.tar.gz",
             "https://github.com/jgm/pandoc/releases/download/3.10.2/pandoc-3.10.2-x86_64-macOS.zip",
+            "https://github.com/firecrawl/pdfium-rs/releases/download/native-v7988/firecrawl-pdfium-mac-x64.tgz",
         )),
         ("macos", "aarch64") => Ok((
             "https://github.com/microsoft/onnxruntime/releases/download/v1.28.1/onnxruntime-osx-arm64-1.28.1.tgz",
             "https://github.com/ggml-org/llama.cpp/releases/download/b10603/llama-b10603-bin-macos-arm64.tar.gz",
             "https://github.com/jgm/pandoc/releases/download/3.10.2/pandoc-3.10.2-arm64-macOS.zip",
+            "https://github.com/firecrawl/pdfium-rs/releases/download/native-v7988/firecrawl-pdfium-mac-arm64.tgz",
         )),
         ("linux", "x86_64") => Ok((
             "https://github.com/microsoft/onnxruntime/releases/download/v1.28.1/onnxruntime-linux-x64-1.28.1.tgz",
             "https://github.com/ggml-org/llama.cpp/releases/download/b10603/llama-b10603-bin-ubuntu-x64.tar.gz",
             "https://github.com/jgm/pandoc/releases/download/3.10.2/pandoc-3.10.2-linux-amd64.tar.gz",
+            "https://github.com/firecrawl/pdfium-rs/releases/download/native-v7988/firecrawl-pdfium-linux-x64.tgz",
         )),
         ("linux", "aarch64") => Ok((
             "https://github.com/microsoft/onnxruntime/releases/download/v1.28.1/onnxruntime-linux-aarch64-1.28.1.tgz",
             "https://github.com/ggml-org/llama.cpp/releases/download/b10603/llama-b10603-bin-ubuntu-arm64.tar.gz",
             "https://github.com/jgm/pandoc/releases/download/3.10.2/pandoc-3.10.2-linux-arm64.tar.gz",
+            "https://github.com/firecrawl/pdfium-rs/releases/download/native-v7988/firecrawl-pdfium-linux-arm64.tgz",
         )),
         (os, arch) => Err(format!("No dependency package is defined for {os}/{arch}")),
     }

@@ -13,16 +13,18 @@ pub enum DependencyKey {
     OrtDll,
     LlamaServer,
     Pandoc,
+    Pdfium,
 }
 
 impl DependencyKey {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::VlmModel,
         Self::Mmproj,
         Self::LayoutModel,
         Self::OrtDll,
         Self::LlamaServer,
         Self::Pandoc,
+        Self::Pdfium,
     ];
 
     pub fn name(self) -> &'static str {
@@ -33,6 +35,7 @@ impl DependencyKey {
             Self::OrtDll => "ort_dll",
             Self::LlamaServer => "llama_server",
             Self::Pandoc => "pandoc",
+            Self::Pdfium => "pdfium",
         }
     }
 }
@@ -52,6 +55,7 @@ pub struct DependencyPaths {
     pub layout_model: PathBuf,
     pub ort_dll: PathBuf,
     pub llama_server: PathBuf,
+    pub pdfium: PathBuf,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -100,6 +104,7 @@ impl RuntimeConfig {
                 layout_model: root.join("layout/inference.onnx"),
                 ort_dll: root.join("onnxruntime").join(ort_library_name()),
                 llama_server: root.join("llama").join(executable_name("llama-server")),
+                pdfium: root.join("pdfium").join(pdfium_library_name()),
             },
             tools: ToolPaths {
                 pandoc: root.join("pandoc").join(executable_name("pandoc")),
@@ -115,6 +120,7 @@ impl RuntimeConfig {
             DependencyKey::OrtDll => &self.dependencies.ort_dll,
             DependencyKey::LlamaServer => &self.dependencies.llama_server,
             DependencyKey::Pandoc => &self.tools.pandoc,
+            DependencyKey::Pdfium => &self.dependencies.pdfium,
         }
     }
 
@@ -137,6 +143,7 @@ impl RuntimeConfig {
             DependencyKey::OrtDll => &mut self.dependencies.ort_dll,
             DependencyKey::LlamaServer => &mut self.dependencies.llama_server,
             DependencyKey::Pandoc => &mut self.tools.pandoc,
+            DependencyKey::Pdfium => &mut self.dependencies.pdfium,
         }
     }
 }
@@ -172,6 +179,16 @@ pub fn ort_library_name() -> &'static str {
         "libonnxruntime.dylib"
     } else {
         "libonnxruntime.so"
+    }
+}
+
+pub fn pdfium_library_name() -> &'static str {
+    if cfg!(windows) {
+        "pdfium.dll"
+    } else if cfg!(target_os = "macos") {
+        "libpdfium.dylib"
+    } else {
+        "libpdfium.so"
     }
 }
 

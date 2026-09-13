@@ -1,7 +1,7 @@
 # BIBIOCR
 
 BIBIOCR is a Rust/C++ offline OCR desktop app for Windows, macOS and Linux. It
-processes one image at a time, reads clipboard images, and exports structured
+processes images or folders, reads clipboard images, and exports structured
 Markdown or Word documents.
 
 ## Required downloads
@@ -17,10 +17,15 @@ mmproj = '.../PaddleOCR-VL-1.6-GGUF-mmproj.gguf'
 layout_model = '.../inference.onnx'
 ort_dll = '.../onnxruntime.dll'
 llama_server = '.../llama-server.exe'
+pdfium = '.../pdfium.dll'
 
 [tools]
 pandoc = '.../pandoc.exe'
 ```
+
+## Batch conversion
+
+Open **Batch Processing**, choose separate input and output folders, then start the batch. Supported office documents are converted with [AnyDoc](https://github.com/firecrawl/anydoc); images and scanned PDF pages are recognized by BIBIOCR. Every input produces `original-name.ext.md` and `original-name.ext.docx` in the output folder.
 
 Model files are downloaded with the official
 [`hf-hub`](https://github.com/huggingface/hf-hub) Rust client. Choose

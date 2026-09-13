@@ -6,6 +6,7 @@ mmproj = 'runtime\models\PaddleOCR-VL-1.6-GGUF-mmproj.gguf'
 layout_model = 'runtime\layout\inference.onnx'
 ort_dll = 'runtime\onnxruntime\onnxruntime.dll'
 llama_server = 'runtime\llama\llama-server.exe'
+pdfium = 'runtime\pdfium\pdfium.dll'
 
 [tools]
 pandoc = 'runtime\pandoc\pandoc.exe'

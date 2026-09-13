@@ -5,7 +5,7 @@ use crate::{
 use std::{
     env, fs,
     panic::{AssertUnwindSafe, catch_unwind},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     thread,
     time::{SystemTime, UNIX_EPOCH},
@@ -34,48 +34,20 @@ pub fn start_pipeline(image_path: PathBuf) -> Receiver<BackendEvent> {
                 0.08,
                 rust_i18n::t!("loading_models").into_owned(),
             ));
-            let config_path = match config_path() {
-                Ok(path) => path,
-                Err(error) => {
-                    let _ = sender.send(BackendEvent::Failed(error));
-                    return;
-                }
-            };
-            let output_dir = output_directory();
-            if let Err(error) = fs::create_dir_all(&output_dir) {
-                let _ = sender.send(BackendEvent::Failed(format!(
-                    "Cannot create output directory / 无法创建输出目录: {error}"
-                )));
-                return;
-            }
-
             let _ = sender.send(BackendEvent::Progress(
                 0.20,
                 rust_i18n::t!("detecting_layout").into_owned(),
             ));
-            let image = image_path.to_string_lossy();
-            let output = output_dir.to_string_lossy();
-            let config = config_path.to_string_lossy();
-            cxx::let_cxx_string!(image_cxx = image.as_ref());
-            cxx::let_cxx_string!(output_cxx = output.as_ref());
-            cxx::let_cxx_string!(config_cxx = config.as_ref());
-
-            match bridge::run_pipeline(&image_cxx, &output_cxx, &config_cxx) {
-                Ok(result) => {
+            match process_image(&image_path) {
+                Ok(output) => {
                     let _ = sender.send(BackendEvent::Progress(
                         0.94,
                         rust_i18n::t!("loading_artifacts").into_owned(),
                     ));
-                    let _ = sender.send(BackendEvent::Complete(PipelineOutput {
-                        markdown: result.markdown,
-                        overlay_path: PathBuf::from(result.layout_path),
-                        output_dir: PathBuf::from(result.output_dir),
-                    }));
+                    let _ = sender.send(BackendEvent::Complete(output));
                 }
                 Err(error) => {
-                    let _ = sender.send(BackendEvent::Failed(format!(
-                        "C++ pipeline failed / C++ 管线失败: {error}"
-                    )));
+                    let _ = sender.send(BackendEvent::Failed(error));
                 }
             }
         }));
@@ -86,6 +58,26 @@ pub fn start_pipeline(image_path: PathBuf) -> Receiver<BackendEvent> {
         }
     });
     receiver
+}
+
+pub fn process_image(image_path: &Path) -> Result<PipelineOutput, String> {
+    let config_path = config_path()?;
+    let output_dir = output_directory();
+    fs::create_dir_all(&output_dir)
+        .map_err(|error| format!("Cannot create output directory / 无法创建输出目录: {error}"))?;
+    let image = image_path.to_string_lossy();
+    let output = output_dir.to_string_lossy();
+    let config = config_path.to_string_lossy();
+    cxx::let_cxx_string!(image_cxx = image.as_ref());
+    cxx::let_cxx_string!(output_cxx = output.as_ref());
+    cxx::let_cxx_string!(config_cxx = config.as_ref());
+    bridge::run_pipeline(&image_cxx, &output_cxx, &config_cxx)
+        .map(|result| PipelineOutput {
+            markdown: result.markdown,
+            overlay_path: PathBuf::from(result.layout_path),
+            output_dir: PathBuf::from(result.output_dir),
+        })
+        .map_err(|error| format!("C++ pipeline failed / C++ 管线失败: {error}"))
 }
 
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {

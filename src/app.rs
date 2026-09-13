@@ -1,5 +1,6 @@
 use crate::{
     backend::{self, BackendEvent},
+    batch::BatchPanel,
     dependencies::{DependencyKey, RuntimeConfig},
     download::{self, DownloadEvent, DownloadOptions},
     export, html_preview,
@@ -58,6 +59,7 @@ enum WorkspaceTab {
     Original,
     Layout,
     Markdown,
+    Batch,
 }
 
 impl WorkspaceTab {
@@ -66,6 +68,7 @@ impl WorkspaceTab {
             Self::Original => rust_i18n::t!("panel_original").into_owned(),
             Self::Layout => rust_i18n::t!("panel_layout").into_owned(),
             Self::Markdown => rust_i18n::t!("panel_markdown").into_owned(),
+            Self::Batch => rust_i18n::t!("panel_batch").into_owned(),
         }
     }
 }
@@ -86,6 +89,7 @@ struct Workspace {
     markdown_cache: CommonMarkCache,
     output_dir: Option<PathBuf>,
     input_path: Option<PathBuf>,
+    batch: BatchPanel,
 }
 
 impl Default for Workspace {
@@ -100,6 +104,7 @@ impl Default for Workspace {
             markdown_cache: CommonMarkCache::default(),
             output_dir: None,
             input_path: None,
+            batch: BatchPanel::default(),
         }
     }
 }
@@ -624,6 +629,7 @@ impl BibiOcrApp {
         let mut maximize_request: Option<Option<WorkspaceTab>> = None;
         let mut viewer = WorkspaceViewer {
             workspace: &mut self.workspace,
+            runtime_config: &self.runtime_config,
             maximize_request: &mut maximize_request,
         };
         if let Some(tab) = self.maximized {
@@ -838,6 +844,7 @@ impl BibiOcrApp {
     fn frame_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.poll_pipeline(ctx);
         self.poll_downloads(ctx);
+        self.workspace.batch.poll(ctx);
         self.handle_drop(ctx);
 
         egui::Panel::top("top-toolbar")
@@ -912,6 +919,7 @@ fn backend_event_is_terminal(event: &BackendEvent) -> bool {
 
 struct WorkspaceViewer<'a> {
     workspace: &'a mut Workspace,
+    runtime_config: &'a RuntimeConfig,
     maximize_request: &'a mut Option<Option<WorkspaceTab>>,
 }
 
@@ -945,6 +953,7 @@ impl WorkspaceViewer<'_> {
                 rust_i18n::t!("empty_layout").as_ref(),
             ),
             WorkspaceTab::Markdown => markdown_workspace(ui, self.workspace),
+            WorkspaceTab::Batch => self.workspace.batch.ui(ui, self.runtime_config),
         }
     }
 }
@@ -970,7 +979,7 @@ impl TabViewer for WorkspaceViewer<'_> {
 }
 
 fn default_dock_state() -> DockState<WorkspaceTab> {
-    let mut state = DockState::new(vec![WorkspaceTab::Markdown]);
+    let mut state = DockState::new(vec![WorkspaceTab::Markdown, WorkspaceTab::Batch]);
     apply_dock_translations(&mut state);
     let surface = state.main_surface_mut();
     let [_markdown, left] =

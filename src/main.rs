@@ -4,6 +4,7 @@ rust_i18n::i18n!("locales", fallback = "en");
 
 mod app;
 mod backend;
+mod batch;
 mod dependencies;
 mod download;
 mod export;

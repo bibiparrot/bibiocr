@@ -159,7 +159,7 @@ AppConfig load_config(const std::filesystem::path& config_path) {
                                      ": expected key = 'path'");
         }
         const std::string key = trim(line.substr(0, equals));
-        if (std::ranges::find(required, key) == required.end()) {
+        if (std::ranges::find(required, key) == required.end() && key != "pdfium") {
             throw std::runtime_error("bibiocr.toml line " +
                                      std::to_string(line_number) +
                                      ": unknown dependency key " + key);
@@ -169,7 +169,11 @@ AppConfig load_config(const std::filesystem::path& config_path) {
                                      std::to_string(line_number) +
                                      ": duplicate dependency key " + key);
         }
-        values.emplace(key, parse_string(line.substr(equals + 1), line_number));
+        if (key != "pdfium") {
+            values.emplace(key, parse_string(line.substr(equals + 1), line_number));
+        } else {
+            (void)parse_string(line.substr(equals + 1), line_number);
+        }
     }
 
     for (const std::string& key : required) {
