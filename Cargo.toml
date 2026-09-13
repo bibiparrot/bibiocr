@@ -1,6 +1,6 @@
 [package]
 name = "bibiocr"
-version = "2.2.1"
+version = "2.2.2"
 edition = "2024"
 description = "A cross-platform OCR desktop utility built with egui"
 license = "MIT"

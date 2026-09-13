@@ -75,8 +75,6 @@ impl BatchPanel {
 
     pub fn ui(&mut self, ui: &mut egui::Ui, config: &RuntimeConfig) {
         let busy = self.worker.is_some();
-        ui.label(rust_i18n::t!("batch_intro"));
-        ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label(rust_i18n::t!("batch_input"));
             ui.label(

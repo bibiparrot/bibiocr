@@ -12,6 +12,7 @@ mod html_preview;
 mod locale;
 mod model_runtimes;
 mod settings;
+mod yaml_panel;
 
 use app::BibiOcrApp;
 use eframe::egui;

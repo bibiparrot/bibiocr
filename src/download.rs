@@ -14,6 +14,7 @@ use std::{
 #[derive(Clone, Debug)]
 pub struct DownloadOptions {
     pub proxy: String,
+    pub no_proxy: bool,
     pub hf_endpoint: String,
     pub github_proxy: String,
     pub resume: bool,
@@ -274,7 +275,7 @@ fn download_file(
         num_connections: 8,
         headers: reqwest::header::HeaderMap::new(),
         user_agent: concat!("bibiocr/", env!("CARGO_PKG_VERSION")).to_owned(),
-        no_proxy: false,
+        no_proxy: options.no_proxy,
         quiet: true,
         verbose: 0,
         alternate: false,

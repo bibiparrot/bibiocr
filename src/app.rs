@@ -5,7 +5,8 @@ use crate::{
     export, html_preview,
     locale::{LocaleManager, SUPPORTED_LOCALES},
     model_runtimes::{self, BackendEvent},
-    settings::AppSettings,
+    settings::{AppSettings, ProxyMode},
+    yaml_panel::YamlPanel,
 };
 use arboard::Clipboard;
 use eframe::egui::{
@@ -60,6 +61,7 @@ enum WorkspaceTab {
     Layout,
     Markdown,
     Batch,
+    Yaml,
 }
 
 impl WorkspaceTab {
@@ -69,6 +71,7 @@ impl WorkspaceTab {
             Self::Layout => rust_i18n::t!("panel_layout").into_owned(),
             Self::Markdown => rust_i18n::t!("panel_markdown").into_owned(),
             Self::Batch => rust_i18n::t!("panel_batch").into_owned(),
+            Self::Yaml => rust_i18n::t!("panel_yaml").into_owned(),
         }
     }
 }
@@ -90,6 +93,7 @@ struct Workspace {
     output_dir: Option<PathBuf>,
     input_path: Option<PathBuf>,
     batch: BatchPanel,
+    yaml: YamlPanel,
 }
 
 impl Default for Workspace {
@@ -105,6 +109,7 @@ impl Default for Workspace {
             output_dir: None,
             input_path: None,
             batch: BatchPanel::default(),
+            yaml: YamlPanel::default(),
         }
     }
 }
@@ -432,6 +437,7 @@ impl BibiOcrApp {
                     .use_proxy
                     .then(|| self.settings.proxy.clone())
                     .unwrap_or_default(),
+                no_proxy: self.settings.proxy_mode() == ProxyMode::None,
                 hf_endpoint: if self.settings.use_hf_mirror {
                     self.settings.hf_endpoint.clone()
                 } else {
@@ -738,42 +744,60 @@ impl BibiOcrApp {
             .show(ctx, |ui| {
                 ui.label(rust_i18n::t!("dependencies_intro"));
                 ui.separator();
-                ui.horizontal(|ui| {
-                    ui.checkbox(
-                        &mut self.settings.use_hf_mirror,
-                        rust_i18n::t!("use_hf_mirror"),
-                    );
-                    ui.label(rust_i18n::t!("hf_endpoint"));
-                    ui.add_enabled_ui(self.settings.use_hf_mirror, |ui| {
-                        ui.text_edit_singleline(&mut self.settings.hf_endpoint);
-                        if ui.button("HF Mirror").clicked() {
-                            self.settings.hf_endpoint = "https://hf-mirror.com".to_owned();
-                        }
+                ui.group(|ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.strong(rust_i18n::t!("proxy_title"));
+                    let mut mode = self.settings.proxy_mode();
+                    ui.radio_value(&mut mode, ProxyMode::None, rust_i18n::t!("proxy_none"));
+                    ui.radio_value(&mut mode, ProxyMode::System, rust_i18n::t!("proxy_system"));
+                    ui.radio_value(&mut mode, ProxyMode::Manual, rust_i18n::t!("proxy_manual"));
+                    self.settings.set_proxy_mode(mode);
+                    ui.add_enabled_ui(mode == ProxyMode::Manual, |ui| {
+                        ui.indent("manual-proxy", |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(rust_i18n::t!("proxy"));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.settings.proxy)
+                                        .desired_width(520.0)
+                                        .hint_text(rust_i18n::t!("proxy_hint")),
+                                );
+                            });
+                        });
                     });
                 });
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.settings.use_proxy, rust_i18n::t!("use_proxy"));
-                    ui.label(rust_i18n::t!("proxy"));
-                    ui.add_enabled_ui(self.settings.use_proxy, |ui| {
-                        ui.text_edit_singleline(&mut self.settings.proxy);
+                ui.add_space(4.0);
+                ui.group(|ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.checkbox(
+                            &mut self.settings.use_hf_mirror,
+                            rust_i18n::t!("use_hf_mirror"),
+                        );
+                        ui.label(rust_i18n::t!("hf_endpoint"));
+                        ui.add_enabled_ui(self.settings.use_hf_mirror, |ui| {
+                            ui.text_edit_singleline(&mut self.settings.hf_endpoint);
+                            if ui.button("HF Mirror").clicked() {
+                                self.settings.hf_endpoint = "https://hf-mirror.com".to_owned();
+                            }
+                        });
                     });
-                });
-                ui.horizontal(|ui| {
-                    ui.checkbox(
-                        &mut self.settings.use_github_proxy,
-                        rust_i18n::t!("use_github_proxy"),
-                    );
-                    ui.label(rust_i18n::t!("github_proxy"));
-                    ui.add_enabled_ui(self.settings.use_github_proxy, |ui| {
-                        ui.text_edit_singleline(&mut self.settings.github_proxy);
+                    ui.horizontal(|ui| {
+                        ui.checkbox(
+                            &mut self.settings.use_github_proxy,
+                            rust_i18n::t!("use_github_proxy"),
+                        );
+                        ui.label(rust_i18n::t!("github_proxy"));
+                        ui.add_enabled_ui(self.settings.use_github_proxy, |ui| {
+                            ui.text_edit_singleline(&mut self.settings.github_proxy);
+                        });
                     });
+                    ui.small(rust_i18n::t!("github_proxy_hint"));
                 });
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.settings.resume_downloads, rust_i18n::t!("resume"));
                     ui.label(rust_i18n::t!("retries"));
                     ui.add(egui::DragValue::new(&mut self.settings.download_retries).range(0..=10));
                 });
-                ui.small(rust_i18n::t!("github_proxy_hint"));
                 ui.separator();
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for key in DependencyKey::ALL {
@@ -978,6 +1002,7 @@ impl WorkspaceViewer<'_> {
             ),
             WorkspaceTab::Markdown => markdown_workspace(ui, self.workspace),
             WorkspaceTab::Batch => self.workspace.batch.ui(ui, self.runtime_config),
+            WorkspaceTab::Yaml => self.workspace.yaml.ui(ui),
         }
     }
 }
@@ -1003,7 +1028,11 @@ impl TabViewer for WorkspaceViewer<'_> {
 }
 
 fn default_dock_state() -> DockState<WorkspaceTab> {
-    let mut state = DockState::new(vec![WorkspaceTab::Markdown, WorkspaceTab::Batch]);
+    let mut state = DockState::new(vec![
+        WorkspaceTab::Markdown,
+        WorkspaceTab::Batch,
+        WorkspaceTab::Yaml,
+    ]);
     apply_dock_translations(&mut state);
     let surface = state.main_surface_mut();
     let [_markdown, left] =

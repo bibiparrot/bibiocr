@@ -1,6 +1,13 @@
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProxyMode {
+    None,
+    System,
+    Manual,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
@@ -9,6 +16,7 @@ pub struct AppSettings {
     pub locale: String,
     pub last_input_dir: Option<PathBuf>,
     pub use_proxy: bool,
+    pub use_system_proxy: bool,
     pub proxy: String,
     pub use_hf_mirror: bool,
     pub hf_endpoint: String,
@@ -26,6 +34,7 @@ impl Default for AppSettings {
             locale: "system".to_owned(),
             last_input_dir: None,
             use_proxy: false,
+            use_system_proxy: true,
             proxy: String::new(),
             use_hf_mirror: hf_endpoint.is_some() || chinese,
             hf_endpoint: hf_endpoint.unwrap_or_else(|| {
@@ -49,6 +58,21 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
+    pub fn proxy_mode(&self) -> ProxyMode {
+        if self.use_proxy {
+            ProxyMode::Manual
+        } else if self.use_system_proxy {
+            ProxyMode::System
+        } else {
+            ProxyMode::None
+        }
+    }
+
+    pub fn set_proxy_mode(&mut self, mode: ProxyMode) {
+        self.use_proxy = mode == ProxyMode::Manual;
+        self.use_system_proxy = mode == ProxyMode::System;
+    }
+
     pub fn load() -> Self {
         let path = settings_path();
         fs::read_to_string(path)
@@ -66,6 +90,20 @@ impl AppSettings {
         let contents = toml::to_string_pretty(self)
             .map_err(|error| format!("Cannot serialize settings: {error}"))?;
         fs::write(path, contents).map_err(|error| format!("Cannot save settings: {error}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AppSettings, ProxyMode};
+
+    #[test]
+    fn proxy_modes_are_mutually_exclusive() {
+        let mut settings = AppSettings::default();
+        for mode in [ProxyMode::None, ProxyMode::System, ProxyMode::Manual] {
+            settings.set_proxy_mode(mode);
+            assert_eq!(settings.proxy_mode(), mode);
+        }
     }
 }
 
