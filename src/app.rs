@@ -1,12 +1,12 @@
 use crate::{
     batch::BatchPanel,
+    config_panel::ConfigPanel,
     dependencies::{DependencyKey, RuntimeConfig},
     download::{self, DownloadEvent, DownloadOptions},
     export, html_preview,
     locale::{LocaleManager, SUPPORTED_LOCALES},
     model_runtimes::{self, BackendEvent},
     settings::{AppSettings, ProxyMode},
-    yaml_panel::YamlPanel,
 };
 use arboard::Clipboard;
 use eframe::egui::{
@@ -29,6 +29,7 @@ const GREEN: Color32 = Color32::from_rgb(0, 173, 79);
 const BLUE: Color32 = Color32::from_rgb(0, 116, 188);
 const WORKSPACE_BG: Color32 = Color32::from_rgb(238, 241, 245);
 const MAX_IMAGE_PIXELS: usize = 64 * 1024 * 1024;
+const CJK_FONT: &[u8] = include_bytes!("../assets/fonts/NotoSansCJKsc-Regular.otf");
 
 struct LoadedImage {
     size: [usize; 2],
@@ -61,7 +62,7 @@ enum WorkspaceTab {
     Layout,
     Markdown,
     Batch,
-    Yaml,
+    Config,
 }
 
 impl WorkspaceTab {
@@ -71,7 +72,7 @@ impl WorkspaceTab {
             Self::Layout => rust_i18n::t!("panel_layout").into_owned(),
             Self::Markdown => rust_i18n::t!("panel_markdown").into_owned(),
             Self::Batch => rust_i18n::t!("panel_batch").into_owned(),
-            Self::Yaml => rust_i18n::t!("panel_yaml").into_owned(),
+            Self::Config => rust_i18n::t!("panel_config").into_owned(),
         }
     }
 }
@@ -93,7 +94,7 @@ struct Workspace {
     output_dir: Option<PathBuf>,
     input_path: Option<PathBuf>,
     batch: BatchPanel,
-    yaml: YamlPanel,
+    config: ConfigPanel,
 }
 
 impl Default for Workspace {
@@ -109,7 +110,7 @@ impl Default for Workspace {
             output_dir: None,
             input_path: None,
             batch: BatchPanel::default(),
-            yaml: YamlPanel::default(),
+            config: ConfigPanel::default(),
         }
     }
 }
@@ -647,7 +648,7 @@ impl BibiOcrApp {
         let mut maximize_request: Option<Option<WorkspaceTab>> = None;
         let mut viewer = WorkspaceViewer {
             workspace: &mut self.workspace,
-            runtime_config: &self.runtime_config,
+            runtime_config: &mut self.runtime_config,
             maximize_request: &mut maximize_request,
         };
         if let Some(tab) = self.maximized {
@@ -967,7 +968,7 @@ fn backend_event_is_terminal(event: &BackendEvent) -> bool {
 
 struct WorkspaceViewer<'a> {
     workspace: &'a mut Workspace,
-    runtime_config: &'a RuntimeConfig,
+    runtime_config: &'a mut RuntimeConfig,
     maximize_request: &'a mut Option<Option<WorkspaceTab>>,
 }
 
@@ -1002,7 +1003,7 @@ impl WorkspaceViewer<'_> {
             ),
             WorkspaceTab::Markdown => markdown_workspace(ui, self.workspace),
             WorkspaceTab::Batch => self.workspace.batch.ui(ui, self.runtime_config),
-            WorkspaceTab::Yaml => self.workspace.yaml.ui(ui),
+            WorkspaceTab::Config => self.workspace.config.ui(ui, self.runtime_config),
         }
     }
 }
@@ -1031,7 +1032,7 @@ fn default_dock_state() -> DockState<WorkspaceTab> {
     let mut state = DockState::new(vec![
         WorkspaceTab::Markdown,
         WorkspaceTab::Batch,
-        WorkspaceTab::Yaml,
+        WorkspaceTab::Config,
     ]);
     apply_dock_translations(&mut state);
     let surface = state.main_surface_mut();
@@ -1212,50 +1213,17 @@ fn configure_style(ctx: &egui::Context) {
 }
 
 fn install_cjk_font(ctx: &egui::Context) {
-    let candidates = if cfg!(target_os = "windows") {
-        vec![
-            PathBuf::from(r"C:\Windows\Fonts\msyh.ttc"),
-            PathBuf::from(r"C:\Windows\Fonts\simhei.ttf"),
-            PathBuf::from(r"C:\Windows\Fonts\meiryo.ttc"),
-            PathBuf::from(r"C:\Windows\Fonts\malgun.ttf"),
-        ]
-    } else if cfg!(target_os = "macos") {
-        vec![
-            PathBuf::from("/System/Library/Fonts/PingFang.ttc"),
-            PathBuf::from("/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc"),
-            PathBuf::from("/System/Library/Fonts/AppleSDGothicNeo.ttc"),
-        ]
-    } else {
-        vec![
-            PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
-            PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf"),
-            PathBuf::from("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"),
-        ]
-    };
-    let loaded: Vec<_> = candidates
-        .into_iter()
-        .filter_map(|path| fs::read(path).ok())
-        .collect();
-    if loaded.is_empty() {
-        return;
-    }
     let mut fonts = FontDefinitions::default();
-    let names: Vec<_> = loaded
-        .into_iter()
-        .enumerate()
-        .map(|(index, bytes)| {
-            let name = format!("system-i18n-{index}");
-            fonts
-                .font_data
-                .insert(name.clone(), FontData::from_owned(bytes).into());
-            name
-        })
-        .collect();
+    let name = "noto-sans-cjk-sc".to_owned();
+    fonts
+        .font_data
+        .insert(name.clone(), FontData::from_static(CJK_FONT).into());
     for family in [FontFamily::Proportional, FontFamily::Monospace] {
-        let fallback = fonts.families.entry(family).or_default();
-        for name in names.iter().rev() {
-            fallback.insert(0, name.clone());
-        }
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .insert(0, name.clone());
     }
     ctx.set_fonts(fonts);
 }
@@ -1303,6 +1271,12 @@ mod tests {
     };
     use crate::model_runtimes::{BackendEvent, PipelineOutput};
     use std::path::Path;
+
+    #[test]
+    fn bundled_font_contains_chinese_glyphs() {
+        let font = ttf_parser::Face::parse(super::CJK_FONT, 0).unwrap();
+        assert!(font.glyph_index('中').is_some());
+    }
 
     #[test]
     fn export_defaults_to_input_directory_and_stem() {

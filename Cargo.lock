@@ -605,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "bibiocr"
-version = "2.2.2"
+version = "2.2.3"
 dependencies = [
  "anydoc",
  "arboard",
@@ -630,6 +630,7 @@ dependencies = [
  "sys-locale",
  "tokio",
  "toml 0.9.12+spec-1.1.0",
+ "ttf-parser",
  "ureq",
  "winresource",
 ]

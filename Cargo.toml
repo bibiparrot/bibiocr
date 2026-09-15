@@ -1,6 +1,6 @@
 [package]
 name = "bibiocr"
-version = "2.2.2"
+version = "2.2.3"
 edition = "2024"
 description = "A cross-platform OCR desktop utility built with egui"
 license = "MIT"
@@ -34,6 +34,9 @@ ureq = "3.4"
 [build-dependencies]
 cxx-build = "1.0"
 winresource = "0.1.28"
+
+[dev-dependencies]
+ttf-parser = "0.25"
 
 [patch.crates-io]
 # Keep the upstream API while suppressing the console window created by the

@@ -8,7 +8,7 @@ on:
       release_tag:
         description: Release tag
         required: true
-        default: v2.2.2
+        default: v2.2.3
 
 permissions:
   contents: write
@@ -19,12 +19,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release
+      - run: cargo build --release --locked
       - shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/release/bibiocr.exe dist/bibiocr-windows-x86_64.exe
-          Compress-Archive target/release/bibiocr.exe dist/bibiocr-windows-x86_64.zip
+          Copy-Item assets/fonts/LICENSE.txt dist/NotoSansCJK-LICENSE.txt
+          Compress-Archive target/release/bibiocr.exe, assets/fonts/LICENSE.txt dist/bibiocr-windows-x86_64.zip
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x86_64
@@ -42,7 +43,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release
+      - run: cargo build --release --locked
       - shell: bash
         run: |
           set -euxo pipefail
@@ -51,6 +52,16 @@ jobs:
           app=dist/BIBIOCR.app
           mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
           cp target/release/bibiocr "$app/Contents/MacOS/bibiocr"
+          iconset=dist/bibiocr.iconset
+          mkdir -p "$iconset"
+          for size in 16 32 128 256 512; do
+            sips -z "$size" "$size" assets/bibiocr-icon.png --out "$iconset/icon_${size}x${size}.png"
+            retina=$((size * 2))
+            sips -z "$retina" "$retina" assets/bibiocr-icon.png --out "$iconset/icon_${size}x${size}@2x.png"
+          done
+          iconutil -c icns "$iconset" -o "$app/Contents/Resources/bibiocr.icns"
+          rm -rf "$iconset"
+          cp assets/fonts/LICENSE.txt "$app/Contents/Resources/NotoSansCJK-LICENSE.txt"
           cat > "$app/Contents/Info.plist" <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -58,9 +69,14 @@ jobs:
             <key>CFBundleExecutable</key><string>bibiocr</string>
             <key>CFBundleIdentifier</key><string>com.bibiocr.desktop</string>
             <key>CFBundleName</key><string>BIBIOCR</string>
+            <key>CFBundleIconFile</key><string>bibiocr.icns</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
             <key>CFBundleShortVersionString</key><string>${version}</string>
+            <key>NSHighResolutionCapable</key><true/>
           </dict></plist>
           EOF
+          plutil -lint "$app/Contents/Info.plist"
+          test -s "$app/Contents/Resources/bibiocr.icns"
           ditto -c -k --keepParent "$app" "dist/bibiocr-${version}-${{ matrix.arch }}-macOS.zip"
           pkgbuild --component "$app" --install-location /Applications "dist/bibiocr-${version}-${{ matrix.arch }}-macOS.pkg"
           hdiutil create -volname BIBIOCR -srcfolder "$app" -ov -format UDZO "dist/bibiocr-${version}-${{ matrix.arch }}.dmg"
@@ -89,17 +105,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev libasound2-dev rpm
-      - run: cargo build --release
+      - run: cargo build --release --locked
       - shell: bash
         run: |
           set -euxo pipefail
           version="${GITHUB_REF_NAME#v}"
           if [[ "$GITHUB_REF_TYPE" != tag ]]; then version="${{ inputs.release_tag }}"; version="${version#v}"; fi
-          mkdir -p dist deb/DEBIAN deb/usr/bin rpm/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          mkdir -p dist deb/DEBIAN deb/usr/bin deb/usr/share/doc/bibiocr rpm/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
           install -m755 target/release/bibiocr deb/usr/bin/bibiocr
+          install -m644 assets/fonts/LICENSE.txt deb/usr/share/doc/bibiocr/NotoSansCJK-LICENSE.txt
           printf 'Package: bibiocr\nVersion: %s\nArchitecture: %s\nMaintainer: BIBIOCR contributors\nDescription: Offline OCR desktop application\n' "$version" '${{ matrix.deb_arch }}' > deb/DEBIAN/control
           dpkg-deb --build --root-owner-group deb "dist/bibiocr_${version}_${{ matrix.arch }}.deb"
           cp target/release/bibiocr rpm/SOURCES/bibiocr
+          cp assets/fonts/LICENSE.txt rpm/SOURCES/NotoSansCJK-LICENSE.txt
           cat > rpm/SPECS/bibiocr.spec <<EOF
           Name: bibiocr
           Version: ${version}
@@ -111,13 +129,17 @@ jobs:
           %install
           mkdir -p %{buildroot}/usr/bin
           install -m755 %{_sourcedir}/bibiocr %{buildroot}/usr/bin/bibiocr
+          mkdir -p %{buildroot}/usr/share/doc/bibiocr
+          install -m644 %{_sourcedir}/NotoSansCJK-LICENSE.txt %{buildroot}/usr/share/doc/bibiocr/NotoSansCJK-LICENSE.txt
           %files
           /usr/bin/bibiocr
+          /usr/share/doc/bibiocr/NotoSansCJK-LICENSE.txt
           EOF
           rpmbuild --define "_topdir $PWD/rpm" --target '${{ matrix.arch }}' -bb rpm/SPECS/bibiocr.spec
           cp rpm/RPMS/*/*.rpm "dist/bibiocr-${version}_${{ matrix.arch }}.rpm"
-          mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/256x256/apps
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/256x256/apps AppDir/usr/share/doc/bibiocr
           install -m755 target/release/bibiocr AppDir/usr/bin/bibiocr
+          install -m644 assets/fonts/LICENSE.txt AppDir/usr/share/doc/bibiocr/NotoSansCJK-LICENSE.txt
           cp assets/bibiocr-logo.png AppDir/bibiocr.png
           cp assets/bibiocr-logo.png AppDir/usr/share/icons/hicolor/256x256/apps/bibiocr.png
           printf '[Desktop Entry]\nType=Application\nName=BIBIOCR\nExec=bibiocr\nIcon=bibiocr\nCategories=Office;Graphics;\n' > AppDir/bibiocr.desktop

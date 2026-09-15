@@ -67,12 +67,17 @@ pub struct ToolPaths {
 impl RuntimeConfig {
     pub fn load() -> Self {
         let path = active_config_path();
-        let Some(mut config) = fs::read_to_string(&path)
+        let Some(config) = fs::read_to_string(&path)
             .ok()
-            .and_then(|contents| toml::from_str::<Self>(&contents).ok())
+            .and_then(|contents| Self::from_toml(&contents, &path).ok())
         else {
             return Self::default_for_platform();
         };
+        config
+    }
+
+    pub(crate) fn from_toml(contents: &str, path: &Path) -> Result<Self, toml::de::Error> {
+        let mut config = toml::from_str::<Self>(contents)?;
         let base = path.parent().unwrap_or(Path::new("."));
         for key in DependencyKey::ALL {
             let value = config.path_mut(key);
@@ -80,7 +85,7 @@ impl RuntimeConfig {
                 *value = normalize(&base.join(&*value));
             }
         }
-        config
+        Ok(config)
     }
 
     pub fn save(&self) -> Result<(), String> {

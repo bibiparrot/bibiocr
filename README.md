@@ -4,6 +4,12 @@ BIBIOCR is a Rust/C++ offline OCR desktop app for Windows, macOS and Linux. It
 processes images or folders, reads clipboard images, and exports structured
 Markdown or Word documents.
 
+The app embeds Noto Sans CJK so Chinese, Japanese and Korean text renders
+consistently on every supported macOS version. The BIBIOCR configuration panel
+opens the active `bibiocr.toml` directly, validates it before saving, and writes
+the user configuration path shown in the panel.
+The bundled font and its OFL 1.1 license are under `assets/fonts/`.
+
 ## Required downloads
 
 Models and third-party runtimes are intentionally not bundled. On first launch,
