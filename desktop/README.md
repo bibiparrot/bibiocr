@@ -1,80 +1,42 @@
-# BIBIOCR
+# BIBIOCR 桌面版
 
-BIBIOCR is a Rust/C++ offline OCR desktop app for Windows, macOS and Linux. It
-processes images or folders, reads clipboard images, and exports structured
-Markdown or Word documents.
+把截图、扫描图片和文档整理成可编辑的文字，再导出或听读。支持 **Windows、macOS 和 Linux**。
 
-The app embeds Noto Sans CJK so Chinese, Japanese and Korean text renders
-consistently on every supported macOS version. The BIBIOCR configuration panel
-opens the active `bibiocr.toml` directly, validates it before saving, and writes
-the user configuration path shown in the panel.
-The bundled font and its OFL 1.1 license are under `assets/fonts/`.
+**[下载桌面版](https://github.com/bibiparrot/bibiocr/releases/latest)** · [项目首页](../README.md) · [Android 版](../mobile/README.md)
 
-## Required downloads
+## 软件截图
 
-Models and third-party runtimes are intentionally not bundled. On first launch,
-BIBIOCR opens **Downloads and dependency configuration**. Download everything
-there, or select files already on disk. The resulting `bibiocr.toml` contains:
+![桌面 OCR 示例：原图、版面与文字预览同时展示](docs/bibiocr_2.1_demo.png)
 
-```toml
-[dependencies]
-vlm_model = '.../PaddleOCR-VL-1.6-GGUF.gguf'
-mmproj = '.../PaddleOCR-VL-1.6-GGUF-mmproj.gguf'
-layout_model = '.../inference.onnx'
-ort_dll = '.../onnxruntime.dll'
-llama_server = '.../llama-server.exe'
-pdfium = '.../pdfium.dll'
+*对照原始资料，检查识别出的段落和表格。*
 
-[tools]
-pandoc = '.../pandoc.exe'
-```
+![桌面 2.3.0 实际朗读界面，使用公开演示文字](../docs/screenshots/desktop-read-aloud.png)
 
-## Batch conversion
+*识别结果可以继续编辑、导出，也可以开启离线朗读。*
 
-Open **Batch Processing**, choose separate input and output folders, then start the batch. Supported office documents are converted with [AnyDoc](https://github.com/firecrawl/anydoc); images and scanned PDF pages are recognized by BIBIOCR. Every input produces `original-name.ext.md` and `original-name.ext.docx` in the output folder.
+## 让资料整理更省心
 
-Model files are downloaded with the official
-[`hf-hub`](https://github.com/huggingface/hf-hub) Rust client. Choose
-`https://huggingface.co` or the China mirror `https://hf-mirror.com` in the UI
-(equivalent to `HF_ENDPOINT=https://hf-mirror.com`). HTTP(S)/SOCKS proxy, retry count,
-progress and resumable downloads are supported. Proxy, HF mirror, and GitHub
-acceleration can each be enabled or disabled independently.
+- **读取图片与剪贴板截图：** 从文件选图，或直接读取剪贴板里的图片，减少中间操作。
+- **识别文档结构：** 整理标题、段落和表格等内容，输出 Markdown，方便继续加工。
+- **原图、版面和结果对照：** 在同一窗口核对内容，支持缩放、平移和面板最大化。
+- **编辑与排版预览：** 在 Markdown 编辑器修改结果，切换预览检查呈现效果。
+- **导出 Word 与 Markdown：** 保存为 `.docx` 或 `.md`，继续用于办公、学习笔记或知识库。
+- **批量处理文件夹：** 将图片、扫描 PDF 和支持的办公文档批量转换到指定输出文件夹。
+- **离线听读：** 中文／英文 Melo 和英文 Kokoro，支持暂停、继续、停止、句子高亮、语速与音量调整。语速变化保留音调，已有语音可以缓存复用。
+- **按自己的网络条件下载：** 支持断点续传、镜像和代理设置，也可选择已经下载的模型文件。
 
-GitHub release assets are downloaded by the bundled `bibiget` 0.1.1 library
-with eight parallel connections, resumable checkpoints, proxy support, and GUI progress events.
+图片识别与语音合成在本机运行。准备好模型后可以离线使用，无需账号或云端 API 密钥。
 
-For GitHub release assets, leave acceleration blank for direct GitHub access or
-use a template such as `https://gh-proxy.com/${giturl}`. `${giturl}` is replaced
-with the original GitHub URL.
+## 三步开始
 
-## UI Demo
-![DEMO Image](docs/bibiocr_2.1_demo.png)
+1. 从 [发布页](https://github.com/bibiparrot/bibiocr/releases/latest) 下载对应系统和架构的安装包。Windows 用户需完整解压 ZIP 后运行 `bibiocr.exe`。
+2. 首次打开时，在「下载与依赖」页面完成所需下载，或选择本机已有文件；使用朗读时，在「朗读」窗口准备语音模型。
+3. 点击「读取图片文件」或「读取剪贴板图片」，识别后核对、编辑，再导出或朗读。
 
+批量整理时，打开「批量文件处理」，选择不同的输入和输出文件夹，再启动任务。扫描 PDF 从此入口处理。
 
+首次准备模型和相关工具需要联网并预留磁盘空间。macOS 安装包目前未经 Apple 公证；Linux 需要 GTK、ALSA 和 OpenGL 系统组件。识别效果受图片清晰度和排版影响，导出前建议核对原文。
 
-## Language support
+## 开源与反馈
 
-- English
-- Chinese
-- French
-- Russian
-- Korean
-- Japanese
-
-## Build and offline speech
-
-From the repository root: `cargo build --manifest-path desktop/Cargo.toml --release --locked`.
-Open **Read aloud** to select Melo (Chinese/English) or Kokoro (English), download
-voice models, and read the current Markdown. Playback supports pause, resume,
-stop, live volume, pitch-preserving speed and sentence highlighting. Audio is
-cached under the application runtime directory; Regenerate creates a new cache
-revision. Speech stops when the current Markdown changes.
-
-The copied mobile synthesis modules retain their regression tests. Both apps
-keep independent Cargo manifests, lockfiles and outputs because mobile uses
-Android-specific dependency patches.
-
-## License
-
-GPL-3.0-only for application source. Vendored libraries, fonts and downloaded
-models retain their original licenses. See `LICENSE` and `../THIRD_PARTY_NOTICES.md`.
+应用代码采用 [GPL-3.0-only](LICENSE)。第三方材料保留原有许可，见 [第三方声明](../THIRD_PARTY_NOTICES.md)。欢迎通过 [GitHub Issues](https://github.com/bibiparrot/bibiocr/issues) 反馈问题或建议。
