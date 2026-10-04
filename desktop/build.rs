@@ -29,6 +29,7 @@ fn main() {
         resource.set("ProductName", "BIBIOCR");
         resource.set("FileDescription", "BIBIOCR image-to-Markdown workspace");
         resource.set("LegalCopyright", "BIBIOCR contributors");
+        resource.set("Comments", "Licensed under GPL-3.0-only");
         if let Err(error) = resource.compile() {
             println!("cargo:warning=Could not embed Windows resources: {error}");
         }

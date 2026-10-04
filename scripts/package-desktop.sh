@@ -81,4 +81,39 @@ EOF
   chmod +x dist/deb/usr/bin/bibiocr
   printf 'Package: bibiocr\nVersion: %s\nArchitecture: %s\nMaintainer: BIBIOCR contributors\nDepends: libasound2, libgtk-3-0, libxkbcommon0, libwayland-client0, libgl1\nDescription: Offline OCR and TTS desktop application\n' "$version" "$deb_arch" > dist/deb/DEBIAN/control
   dpkg-deb --build --root-owner-group dist/deb "dist/bibiocr_${version}_${deb_arch}.deb"
+  mkdir -p dist/rpm/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+  cp -R "$stage" dist/rpm/SOURCES/bibiocr
+  cat > dist/rpm/SPECS/bibiocr.spec <<EOF
+Name: bibiocr
+Version: $version
+Release: 1
+Summary: Offline OCR and TTS desktop application
+License: GPL-3.0-only
+Requires: alsa-lib, gtk3, libxkbcommon, wayland-libs, mesa-libGL
+%description
+BIBIOCR offline OCR and TTS desktop application.
+%install
+mkdir -p %{buildroot}/usr/lib/bibiocr %{buildroot}/usr/bin
+cp -R %{_sourcedir}/bibiocr/. %{buildroot}/usr/lib/bibiocr/
+cp $root/dist/deb/usr/bin/bibiocr %{buildroot}/usr/bin/bibiocr
+%files
+/usr/bin/bibiocr
+/usr/lib/bibiocr
+EOF
+  rpmbuild --define "_topdir $root/dist/rpm" --target "$arch" -bb dist/rpm/SPECS/bibiocr.spec
+  cp dist/rpm/RPMS/*/*.rpm "dist/bibiocr-$version-linux-$arch.rpm"
+  appdir=dist/AppDir
+  mkdir -p "$appdir/usr/lib/bibiocr"
+  cp -R "$stage/". "$appdir/usr/lib/bibiocr/"
+  cp desktop/assets/bibiocr-logo.png "$appdir/bibiocr.png"
+  printf '[Desktop Entry]\nType=Application\nName=BIBIOCR\nExec=bibiocr\nIcon=bibiocr\nCategories=Office;Graphics;\n' > "$appdir/bibiocr.desktop"
+  cat > "$appdir/AppRun" <<'EOF'
+#!/bin/sh
+export LD_LIBRARY_PATH="$APPDIR/usr/lib/bibiocr${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$APPDIR/usr/lib/bibiocr/bibiocr" "$@"
+EOF
+  chmod +x "$appdir/AppRun"
+  curl --fail --location --retry 3 -o dist/appimagetool "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-$arch.AppImage"
+  chmod +x dist/appimagetool
+  ARCH="$arch" dist/appimagetool --appimage-extract-and-run "$appdir" "dist/bibiocr-$version-linux-$arch.AppImage"
 fi

@@ -50,6 +50,15 @@ pub fn synthesize(text: &str, model_dir: &Path) -> Result<Arc<TtsAudio>, String>
 
 impl KokoroRuntime {
     fn load(model_dir: &Path) -> Result<Self, String> {
+        // Load the same bundled runtime used by sherpa, independent of cwd and PATH.
+        let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+        let runtime = executable
+            .parent()
+            .ok_or("Cannot locate the speech runtime directory")?
+            .join(crate::dependencies::ort_library_name());
+        ort::init_from(runtime)
+            .map_err(|error| format!("Kokoro runtime load failed: {error}"))?
+            .commit();
         let model = model_dir.join("kokoro-model.onnx");
         let session = Session::builder()
             .map_err(|error| error.to_string())?

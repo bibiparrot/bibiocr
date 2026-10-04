@@ -693,6 +693,10 @@ impl BibiOcrApp {
             .resizable(false)
             .default_width(640.0)
             .show(ctx, |ui| {
+                ui.hyperlink_to(
+                    "GPL-3.0-only",
+                    "https://github.com/bibiparrot/bibiocr/blob/main/LICENSE",
+                );
                 ui.add(
                     egui::Label::new(RichText::new(rust_i18n::t!("about_description")).size(17.0))
                         .wrap(),
