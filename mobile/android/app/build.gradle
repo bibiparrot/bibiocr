@@ -1,0 +1,50 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.bibiocr.mobile'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.bibiocr.mobile'
+        minSdk 27
+        targetSdk 35
+        // Keep this above the previously installed cargo-apk versionCode.
+        versionCode 16777479
+        versionName '0.1.6'
+    }
+
+    sourceSets {
+        main {
+            res.srcDirs = ['../../android-res']
+        }
+    }
+
+    splits {
+        abi {
+            enable true
+            reset()
+            include 'arm64-v8a', 'armeabi-v7a', 'x86', 'x86_64'
+            universalApk false
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            // The first GitHub beta keeps the existing on-device update signature.
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'androidx.games:games-activity:4.4.0'
+}

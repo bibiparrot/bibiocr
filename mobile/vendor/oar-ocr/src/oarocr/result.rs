@@ -1,0 +1,175 @@
+//! Result types for the OAROCR pipeline.
+
+use image::RgbImage;
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::sync::Arc;
+
+// Re-export TextRegion from core for backward compatibility
+pub use oar_ocr_core::domain::TextRegion;
+
+/// Result of the OAROCR pipeline execution.
+///
+/// This struct contains all the results from processing an image through
+/// the OCR pipeline, including detected text boxes, recognized text, and
+/// any intermediate processing results.
+///
+/// # Coordinate System
+///
+/// **Important**: All bounding boxes (`text_regions.bounding_box` and `word_boxes`)
+/// are in the **original input image's coordinate system**, even if transformations
+/// were applied during processing.
+///
+/// ## Rotation Correction
+/// - If `orientation_angle` is set, the image was rotated during preprocessing (90°/180°/270°)
+/// - Bounding boxes have been **automatically transformed back** to the original coordinate system
+/// - You can safely overlay boxes on `input_img` for visualization
+///
+/// ## Document Rectification
+/// - If `rectified_img` is set, neural network-based rectification (UVDoc) was applied
+/// - **Limitation**: UVDoc doesn't provide inverse transformations from rectified to distorted coordinates
+/// - Bounding boxes are in the **rectified image's coordinate system**, not the original distorted image
+/// - **Solution**: Use `rectified_img` for visualization instead of `input_img` when rectification was applied
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAROCRResult {
+    /// Path to the input image file.
+    pub input_path: Arc<str>,
+    /// Index of the image in a batch (0 for single image processing).
+    pub index: usize,
+    /// The input image.
+    #[serde(skip)]
+    pub input_img: Arc<RgbImage>,
+    /// Structured text regions containing detection and recognition results.
+    pub text_regions: Vec<TextRegion>,
+    /// Document orientation angle (if orientation classification was used).
+    pub orientation_angle: Option<f32>,
+    /// Rectified image (if document unwarping was used).
+    #[serde(skip)]
+    pub rectified_img: Option<Arc<RgbImage>>,
+}
+
+impl OAROCRResult {
+    /// Returns an iterator over text regions that have recognized text.
+    pub fn recognized_text_regions(&self) -> impl Iterator<Item = &TextRegion> {
+        self.text_regions.iter().filter(|region| region.has_text())
+    }
+
+    /// Returns an iterator over text regions with both text and confidence scores.
+    pub fn confident_text_regions(&self) -> impl Iterator<Item = &TextRegion> {
+        self.text_regions
+            .iter()
+            .filter(|region| region.has_confidence())
+    }
+
+    /// Returns all recognized text as a vector of strings.
+    pub fn all_text(&self) -> Vec<&str> {
+        self.text_regions
+            .iter()
+            .filter_map(|region| region.text.as_ref().map(|s| s.as_ref()))
+            .collect()
+    }
+
+    /// Returns all recognized text concatenated with the specified separator.
+    pub fn concatenated_text(&self, separator: &str) -> String {
+        self.all_text().join(separator)
+    }
+
+    /// Returns the number of text regions that have recognized text.
+    pub fn recognized_text_count(&self) -> usize {
+        self.text_regions
+            .iter()
+            .filter(|region| region.has_text())
+            .count()
+    }
+
+    /// Returns the average confidence score of all recognized text regions.
+    pub fn average_confidence(&self) -> Option<f32> {
+        let confident_regions: Vec<_> = self.confident_text_regions().collect();
+        if confident_regions.is_empty() {
+            None
+        } else {
+            let sum: f32 = confident_regions
+                .iter()
+                .filter_map(|region| region.confidence)
+                .sum();
+            Some(sum / confident_regions.len() as f32)
+        }
+    }
+}
+
+impl fmt::Display for OAROCRResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "Input path: {}", self.input_path)?;
+        writeln!(f, "Page index: {}", self.index)?;
+        writeln!(
+            f,
+            "Image dimensions: [{}, {}]",
+            self.input_img.width(),
+            self.input_img.height()
+        )?;
+
+        if let Some(angle) = self.orientation_angle {
+            writeln!(f, "Orientation angle: {angle:.1}°")?;
+        } else {
+            writeln!(f, "Orientation angle: not detected")?;
+        }
+
+        writeln!(f, "Total text regions: {}", self.text_regions.len())?;
+        writeln!(f, "Recognized texts: {}", self.recognized_text_count())?;
+
+        if !self.text_regions.is_empty() {
+            writeln!(f, "Text regions (detection + recognition):")?;
+
+            // Use the new structured text regions for cleaner iteration
+            for (region_index, region) in self.text_regions.iter().enumerate() {
+                write!(f, "  Region {}: ", region_index + 1)?;
+
+                // Display bounding box
+                let bbox = &region.bounding_box;
+                if bbox.points.is_empty() {
+                    write!(f, "[] (empty)")?;
+                } else {
+                    write!(f, "[")?;
+                    for (j, point) in bbox.points.iter().enumerate() {
+                        if j == 0 {
+                            write!(f, "[{:.0}, {:.0}]", point.x, point.y)?;
+                        } else {
+                            write!(f, ", [{:.0}, {:.0}]", point.x, point.y)?;
+                        }
+                    }
+                    write!(f, "]")?;
+                }
+
+                // Display recognition result if available
+                match (&region.text, region.confidence) {
+                    (Some(text), Some(score)) => {
+                        let orientation_str = match region.orientation_angle {
+                            Some(angle) => format!(" (orientation: {angle:.1}°)"),
+                            None => String::new(),
+                        };
+                        writeln!(f, " -> '{text}' (confidence: {score:.3}){orientation_str}")?;
+                    }
+                    _ => {
+                        writeln!(f, " -> [no text recognized]")?;
+                    }
+                }
+            }
+        }
+
+        if let Some(rectified_img) = &self.rectified_img {
+            writeln!(
+                f,
+                "Rectified image: available [{} x {}]",
+                rectified_img.width(),
+                rectified_img.height()
+            )?;
+        } else {
+            writeln!(
+                f,
+                "Rectified image: not available (document unwarping not enabled)"
+            )?;
+        }
+
+        Ok(())
+    }
+}

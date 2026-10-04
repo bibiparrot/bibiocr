@@ -1,0 +1,13 @@
+[package]
+name = "robius-android-env"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+jni = "0.21.1"
+ndk-context = "0.1.0"
+
+[features]
+default = ["ndk-context"]
+ndk-context = []

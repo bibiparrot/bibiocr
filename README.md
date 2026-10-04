@@ -1,62 +1,35 @@
 # BIBIOCR
 
-BIBIOCR is a Rust/C++ offline OCR desktop app for Windows, macOS and Linux. It
-processes images or folders, reads clipboard images, and exports structured
-Markdown or Word documents.
+Offline OCR and text-to-speech for desktop and Android, licensed under GPL-3.0-only.
 
-The app embeds Noto Sans CJK so Chinese, Japanese and Korean text renders
-consistently on every supported macOS version. The BIBIOCR configuration panel
-opens the active `bibiocr.toml` directly, validates it before saving, and writes
-the user configuration path shown in the panel.
-The bundled font and its OFL 1.1 license are under `assets/fonts/`.
+| Directory | Application | Build |
+| --- | --- | --- |
+| [`desktop/`](desktop/) | Windows, macOS, Linux desktop | `cargo build --manifest-path desktop/Cargo.toml --release --locked` |
+| [`mobile/`](mobile/) | Android, four ABI APKs | `pwsh -File mobile/scripts/build-android.ps1` |
 
-## Required downloads
+The applications keep separate manifests, lockfiles, assets, native integrations,
+and build outputs. Run tests separately:
 
-Models and third-party runtimes are intentionally not bundled. On first launch,
-BIBIOCR opens **Downloads and dependency configuration**. Download everything
-there, or select files already on disk. The resulting `bibiocr.toml` contains:
-
-```toml
-[dependencies]
-vlm_model = '.../PaddleOCR-VL-1.6-GGUF.gguf'
-mmproj = '.../PaddleOCR-VL-1.6-GGUF-mmproj.gguf'
-layout_model = '.../inference.onnx'
-ort_dll = '.../onnxruntime.dll'
-llama_server = '.../llama-server.exe'
-pdfium = '.../pdfium.dll'
-
-[tools]
-pandoc = '.../pandoc.exe'
+```sh
+cargo test --manifest-path desktop/Cargo.toml --locked
+cargo test --manifest-path mobile/Cargo.toml --lib --locked
 ```
 
-## Batch conversion
+Desktop includes offline Melo (Chinese/English) and Kokoro (English) speech,
+sentence highlighting, pause/resume/stop, volume, pitch-preserving speed control,
+and persistent sentence audio. Open **Read aloud** to download voice models or
+select an existing model directory. The existing download proxy/mirror settings
+also apply to voice downloads. Once models are available, synthesis is offline.
 
-Open **Batch Processing**, choose separate input and output folders, then start the batch. Supported office documents are converted with [AnyDoc](https://github.com/firecrawl/anydoc); images and scanned PDF pages are recognized by BIBIOCR. Every input produces `original-name.ext.md` and `original-name.ext.docx` in the output folder.
+See each application's README for OCR setup and platform prerequisites.
+Tagged releases build desktop packages and Android APKs in one workflow, then
+publish them together with GPL license text, source archives, and SHA-256 hashes.
+Android remains `com.bibiocr.mobile` and keeps the existing beta signing key;
+the destination repository needs `ANDROID_DEBUG_KEYSTORE_B64` to build releases.
 
-Model files are downloaded with the official
-[`hf-hub`](https://github.com/huggingface/hf-hub) Rust client. Choose
-`https://huggingface.co` or the China mirror `https://hf-mirror.com` in the UI
-(equivalent to `HF_ENDPOINT=https://hf-mirror.com`). HTTP(S)/SOCKS proxy, retry count,
-progress and resumable downloads are supported. Proxy, HF mirror, and GitHub
-acceleration can each be enabled or disabled independently.
+Third-party code, fonts, runtimes, and model weights retain their upstream
+licenses. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-GitHub release assets are downloaded by the bundled `bibiget` 0.1.1 library
-with eight parallel connections, resumable checkpoints, proxy support, and GUI progress events.
-
-For GitHub release assets, leave acceleration blank for direct GitHub access or
-use a template such as `https://gh-proxy.com/${giturl}`. `${giturl}` is replaced
-with the original GitHub URL.
-
-## UI Demo
-![DEMO Image](docs/bibiocr_2.1_demo.png)
-
-
-
-## Language support
-
-- English
-- Chinese
-- French
-- Russian
-- Korean
-- Japanese
+Mobile was imported from `bibiparrot/bibiocr-mobile` commit
+`63f61fc11633feb6f4ac725c57a57894d188344e`. See
+[mobile/UPSTREAM.md](mobile/UPSTREAM.md) for provenance.
