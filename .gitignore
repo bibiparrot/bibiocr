@@ -1,5 +1,19 @@
-/target/
-/vendor/bibiget/target/
+**/target/
+/dist/
+**/dist/
+**/downloads/
+**/settings.toml
+**/android/.gradle/
+**/android/app/build/
+**/android/build/
+**/android/app/src/main/jniLibs/
+**/android/local.properties
+**/.cargo/config.toml
+*.keystore
+*.jks
 *.pdb
 *.ilk
+/*-test.log
+/*-build.log
+/.task-tools/
 

@@ -1,0 +1,3680 @@
+//! High-level builder API for document structure analysis.
+//!
+//! This module provides a fluent builder interface for constructing document structure
+//! analysis pipelines that can detect layout elements, recognize tables, extract formulas,
+//! and optionally integrate OCR for text extraction.
+
+use super::builder_utils::{
+    build_optional_adapter, default_cpu_region_batch_size, resolve_device_batch_sizes,
+    resolve_model_path, resolve_model_source,
+};
+use oar_ocr_core::core::config::OrtSessionConfig;
+use oar_ocr_core::core::traits::OrtConfigurable;
+use oar_ocr_core::core::traits::adapter::{AdapterBuilder, ModelAdapter};
+use oar_ocr_core::core::{ModelSource, OCRError};
+use oar_ocr_core::domain::adapters::{
+    DocumentOrientationAdapter, DocumentOrientationAdapterBuilder, FormulaRecognitionAdapter,
+    LayoutDetectionAdapter, LayoutDetectionAdapterBuilder, PPFormulaNetAdapterBuilder,
+    SLANetWiredAdapterBuilder, SLANetWirelessAdapterBuilder, SealTextDetectionAdapter,
+    SealTextDetectionAdapterBuilder, TableCellDetectionAdapter, TableCellDetectionAdapterBuilder,
+    TableClassificationAdapter, TableClassificationAdapterBuilder,
+    TableStructureRecognitionAdapter, TextDetectionAdapter, TextDetectionAdapterBuilder,
+    TextLineOrientationAdapter, TextLineOrientationAdapterBuilder, TextRecognitionAdapter,
+    TextRecognitionAdapterBuilder, UVDocRectifierAdapter, UVDocRectifierAdapterBuilder,
+    UniMERNetAdapterBuilder,
+};
+use oar_ocr_core::domain::structure::{StructureResult, TableResult, TableType};
+use oar_ocr_core::domain::tasks::{
+    FormulaRecognitionConfig, LayoutDetectionConfig, TableCellDetectionConfig,
+    TableClassificationConfig, TableStructureRecognitionConfig, TextDetectionConfig,
+    TextRecognitionConfig,
+};
+use oar_ocr_core::predictors::FormulaModelKind;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Instant;
+
+/// IoU threshold for removing overlapping layout elements (0.5 = 50% overlap).
+const LAYOUT_OVERLAP_IOU_THRESHOLD: f32 = 0.5;
+
+/// IoU threshold for determining if an OCR box overlaps with table cells.
+const CELL_OVERLAP_IOU_THRESHOLD: f32 = 0.5;
+
+/// IoA threshold for assigning layout elements to region blocks during reading order.
+/// A low threshold (0.1 = 10%) allows elements near region boundaries to be included.
+const REGION_MEMBERSHIP_IOA_THRESHOLD: f32 = 0.1;
+
+/// IoA threshold for splitting text boxes that intersect with container elements.
+/// A moderate threshold (0.3 = 30%) balances precision with avoiding over-splitting.
+const TEXT_BOX_SPLIT_IOA_THRESHOLD: f32 = 0.3;
+
+/// Internal structure holding the structure analysis pipeline adapters.
+#[derive(Debug)]
+struct StructurePipeline {
+    // Document preprocessing (optional)
+    document_orientation_adapter: Option<DocumentOrientationAdapter>,
+    rectification_adapter: Option<UVDocRectifierAdapter>,
+
+    // Layout analysis (required)
+    layout_detection_adapter: LayoutDetectionAdapter,
+
+    // Region detection for hierarchical ordering (optional, PP-DocBlockLayout)
+    region_detection_adapter: Option<LayoutDetectionAdapter>,
+
+    // Table analysis (optional)
+    table_classification_adapter: Option<TableClassificationAdapter>,
+    table_orientation_adapter: Option<DocumentOrientationAdapter>, // Reuses doc orientation model
+    table_cell_detection_adapter: Option<TableCellDetectionAdapter>,
+    table_structure_recognition_adapter: Option<TableStructureRecognitionAdapter>,
+    // PP-StructureV3 auto-switch: separate adapters for wired/wireless tables
+    wired_table_structure_adapter: Option<TableStructureRecognitionAdapter>,
+    wireless_table_structure_adapter: Option<TableStructureRecognitionAdapter>,
+    wired_table_cell_adapter: Option<TableCellDetectionAdapter>,
+    wireless_table_cell_adapter: Option<TableCellDetectionAdapter>,
+    // E2E mode: when true, skip cell detection and use only structure model output
+    use_e2e_wired_table_rec: bool,
+    use_e2e_wireless_table_rec: bool,
+    // PaddleX compatibility: build table HTML from cell detection boxes
+    use_wired_table_cells_trans_to_html: bool,
+    use_wireless_table_cells_trans_to_html: bool,
+
+    formula_recognition_adapter: Option<FormulaRecognitionAdapter>,
+
+    seal_text_detection_adapter: Option<SealTextDetectionAdapter>,
+
+    // OCR integration (optional)
+    text_detection_adapter: Option<TextDetectionAdapter>,
+    text_line_orientation_adapter: Option<TextLineOrientationAdapter>,
+    text_recognition_adapter: Option<TextRecognitionAdapter>,
+
+    // Batch sizes for image-level and region-level processing.
+    image_batch_size: Option<usize>,
+    region_batch_size: Option<usize>,
+}
+
+/// High-level builder for document structure analysis pipelines.
+///
+/// This builder provides a fluent API for constructing document structure analysis
+/// pipelines with various components:
+/// - Document preprocessing (optional): orientation detection and rectification
+/// - Layout detection (required)
+/// - Table classification (optional)
+/// - Table cell detection (optional)
+/// - Table structure recognition (optional)
+/// - Formula recognition (optional)
+/// - Seal text detection (optional)
+/// - OCR integration (optional)
+///
+/// # Example
+///
+/// ```no_run
+/// use oar_ocr::oarocr::structure::OARStructureBuilder;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let structure = OARStructureBuilder::new("layout.onnx")
+///     .with_table_classification("table_cls.onnx")
+///     .with_table_cell_detection("table_cell.onnx", "wired")
+///     .with_table_structure_recognition("table_struct.onnx", "wired")
+///     .with_formula_recognition(
+///         "formula.onnx",
+///         "tokenizer.json",
+///         "pp_formulanet"
+///     )
+///     .build()?;
+/// # let _ = structure;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone)]
+pub struct OARStructureBuilder {
+    // Required models
+    layout_detection_model: ModelSource,
+    layout_model_name: Option<String>,
+
+    // Optional document preprocessing
+    document_orientation_model: Option<ModelSource>,
+    document_rectification_model: Option<ModelSource>,
+
+    // Optional region detection for hierarchical ordering (PP-DocBlockLayout)
+    region_detection_model: Option<ModelSource>,
+
+    // Optional table analysis models
+    table_classification_model: Option<ModelSource>,
+    table_orientation_model: Option<ModelSource>, // Reuses doc orientation model for rotated tables
+    table_cell_detection_model: Option<ModelSource>,
+    table_cell_detection_type: Option<Result<TableType, String>>,
+    table_structure_recognition_model: Option<ModelSource>,
+    table_structure_recognition_type: Option<Result<TableType, String>>,
+    table_structure_dict_path: Option<PathBuf>,
+
+    wired_table_structure_model: Option<ModelSource>,
+    wireless_table_structure_model: Option<ModelSource>,
+    wired_table_cell_model: Option<ModelSource>,
+    wireless_table_cell_model: Option<ModelSource>,
+    // E2E mode: when true, skip cell detection and use only structure model output
+    // Defaults: wired=false, wireless=true
+    use_e2e_wired_table_rec: bool,
+    use_e2e_wireless_table_rec: bool,
+    // PaddleX compatibility: build table HTML from cell detection boxes
+    // Defaults: wired=false, wireless=false
+    use_wired_table_cells_trans_to_html: bool,
+    use_wireless_table_cells_trans_to_html: bool,
+
+    // Optional formula recognition
+    formula_recognition_model: Option<ModelSource>,
+    formula_recognition_type: Option<Result<FormulaModelKind, String>>,
+    formula_tokenizer_path: Option<PathBuf>,
+    formula_ort_session_config: Option<OrtSessionConfig>,
+
+    // Optional seal text detection
+    seal_text_detection_model: Option<ModelSource>,
+
+    // Optional OCR integration
+    text_detection_model: Option<ModelSource>,
+    text_line_orientation_model: Option<ModelSource>,
+    text_recognition_model: Option<ModelSource>,
+    character_dict_path: Option<PathBuf>,
+
+    // Model name presets for loading correct pre/post processors
+    region_model_name: Option<String>,
+    wired_table_structure_model_name: Option<String>,
+    wireless_table_structure_model_name: Option<String>,
+    wired_table_cell_model_name: Option<String>,
+    wireless_table_cell_model_name: Option<String>,
+    text_detection_model_name: Option<String>,
+    text_recognition_model_name: Option<String>,
+
+    // Configuration
+    ort_session_config: Option<OrtSessionConfig>,
+    layout_detection_config: Option<LayoutDetectionConfig>,
+    table_classification_config: Option<TableClassificationConfig>,
+    table_cell_detection_config: Option<TableCellDetectionConfig>,
+    table_structure_recognition_config: Option<TableStructureRecognitionConfig>,
+    formula_recognition_config: Option<FormulaRecognitionConfig>,
+    text_detection_config: Option<TextDetectionConfig>,
+    text_recognition_config: Option<TextRecognitionConfig>,
+
+    // Batch sizes
+    image_batch_size: Option<usize>,
+    region_batch_size: Option<usize>,
+}
+
+impl OARStructureBuilder {
+    const MAX_BATCH_SIZE: usize = 4096;
+
+    /// Creates a new structure builder with the required layout detection model.
+    ///
+    /// # Arguments
+    ///
+    /// * `layout_detection_model` - Path to the layout detection model file
+    pub fn new(layout_detection_model: impl Into<ModelSource>) -> Self {
+        Self {
+            layout_detection_model: layout_detection_model.into(),
+            layout_model_name: None,
+            document_orientation_model: None,
+            document_rectification_model: None,
+            region_detection_model: None,
+            table_classification_model: None,
+            table_orientation_model: None,
+            table_cell_detection_model: None,
+            table_cell_detection_type: None,
+            table_structure_recognition_model: None,
+            table_structure_recognition_type: None,
+            table_structure_dict_path: None,
+            wired_table_structure_model: None,
+            wireless_table_structure_model: None,
+            wired_table_cell_model: None,
+            wireless_table_cell_model: None,
+            // Defaults: wired=false (use cell detection), wireless=true (E2E mode)
+            use_e2e_wired_table_rec: false,
+            use_e2e_wireless_table_rec: true,
+            use_wired_table_cells_trans_to_html: false,
+            use_wireless_table_cells_trans_to_html: false,
+            formula_recognition_model: None,
+            formula_recognition_type: None,
+            formula_tokenizer_path: None,
+            formula_ort_session_config: None,
+            seal_text_detection_model: None,
+            text_detection_model: None,
+            text_line_orientation_model: None,
+            text_recognition_model: None,
+            character_dict_path: None,
+            region_model_name: None,
+            wired_table_structure_model_name: None,
+            wireless_table_structure_model_name: None,
+            wired_table_cell_model_name: None,
+            wireless_table_cell_model_name: None,
+            text_detection_model_name: None,
+            text_recognition_model_name: None,
+            ort_session_config: None,
+            layout_detection_config: None,
+            table_classification_config: None,
+            table_cell_detection_config: None,
+            table_structure_recognition_config: None,
+            formula_recognition_config: None,
+            text_detection_config: None,
+            text_recognition_config: None,
+            image_batch_size: None,
+            region_batch_size: None,
+        }
+    }
+
+    /// Sets the ONNX Runtime session configuration.
+    ///
+    /// This configuration will be applied to all models in the pipeline.
+    pub fn ort_session(mut self, config: OrtSessionConfig) -> Self {
+        self.ort_session_config = Some(config);
+        self
+    }
+
+    /// Sets the layout detection model configuration.
+    pub fn layout_detection_config(mut self, config: LayoutDetectionConfig) -> Self {
+        self.layout_detection_config = Some(config);
+        self
+    }
+
+    /// Overrides the built-in layout model preset used to configure preprocessing/postprocessing.
+    ///
+    /// This is useful when the ONNX file name alone is not enough to infer the correct
+    /// model family. Preset names are matched case- and separator-insensitively
+    /// (`-` and `_` are interchangeable), so `PP-DocLayout_plus-L` and
+    /// `pp_doclayout_plus_l` are equivalent. Supported presets:
+    /// - `PP-DocLayout_plus-L` (default)
+    /// - `PP-DocLayout-S`, `PP-DocLayout-M`, `PP-DocLayout-L`
+    /// - `PP-DocLayoutV3`
+    /// - `PP-DocBlockLayout`
+    /// - `PicoDet_layout_1x`, `PicoDet_layout_1x_table`
+    /// - `PicoDet-S_layout_3cls`, `PicoDet-L_layout_3cls`
+    /// - `PicoDet-S_layout_17cls`, `PicoDet-L_layout_17cls`
+    /// - `RT-DETR-H_layout_3cls`, `RT-DETR-H_layout_17cls`
+    ///
+    /// An unrecognized name logs a warning and falls back to the default preset.
+    pub fn layout_model_name(mut self, name: impl Into<String>) -> Self {
+        self.layout_model_name = Some(name.into());
+        self
+    }
+
+    /// Sets the region detection model name preset.
+    ///
+    /// This is used to load the correct preprocessing/postprocessing for the region
+    /// detection model. Supported presets: `PP-DocBlockLayout`.
+    pub fn region_model_name(mut self, name: impl Into<String>) -> Self {
+        self.region_model_name = Some(name.into());
+        self
+    }
+
+    /// Sets the reported model name for the wired table structure model
+    /// (e.g. `SLANeXt_wired`).
+    ///
+    /// This is identification metadata: it labels the model in logs and error
+    /// messages. The wired/wireless slot and the table-structure config govern
+    /// the actual input shape and decoding.
+    pub fn wired_table_structure_model_name(mut self, name: impl Into<String>) -> Self {
+        self.wired_table_structure_model_name = Some(name.into());
+        self
+    }
+
+    /// Sets the reported model name for the wireless table structure model
+    /// (e.g. `SLANet_plus`). Identification metadata only; see
+    /// [`Self::wired_table_structure_model_name`].
+    pub fn wireless_table_structure_model_name(mut self, name: impl Into<String>) -> Self {
+        self.wireless_table_structure_model_name = Some(name.into());
+        self
+    }
+
+    /// Sets the reported model name for the wired table cell detector
+    /// (e.g. `RT-DETR-L_wired_table_cell_det`). Identification metadata only.
+    pub fn wired_table_cell_model_name(mut self, name: impl Into<String>) -> Self {
+        self.wired_table_cell_model_name = Some(name.into());
+        self
+    }
+
+    /// Sets the reported model name for the wireless table cell detector
+    /// (e.g. `RT-DETR-L_wireless_table_cell_det`). Identification metadata only.
+    pub fn wireless_table_cell_model_name(mut self, name: impl Into<String>) -> Self {
+        self.wireless_table_cell_model_name = Some(name.into());
+        self
+    }
+
+    /// Sets the reported model name for the text detector
+    /// (e.g. `PP-OCRv5_server_det`). Identification metadata only: detection
+    /// behavior is driven by the config and the ONNX model.
+    pub fn text_detection_model_name(mut self, name: impl Into<String>) -> Self {
+        self.text_detection_model_name = Some(name.into());
+        self
+    }
+
+    /// Sets the reported model name for the text recognizer
+    /// (e.g. `PP-OCRv5_server_rec`). Identification metadata only: recognition
+    /// behavior is driven by the config, dictionary, and the ONNX model.
+    pub fn text_recognition_model_name(mut self, name: impl Into<String>) -> Self {
+        self.text_recognition_model_name = Some(name.into());
+        self
+    }
+
+    /// Sets the batch size for image-level processing.
+    ///
+    /// Controls how many pages are processed together by image-level stages such as
+    /// layout detection, region detection, and OCR text detection. When unset, CPU
+    /// execution uses `1`; explicitly configured accelerators retain adapter defaults.
+    pub fn image_batch_size(mut self, size: usize) -> Self {
+        self.image_batch_size = Some(size);
+        self
+    }
+
+    /// Sets the batch size for region-level processing (text recognition).
+    ///
+    /// Controls how many text regions are processed together during OCR recognition.
+    /// When unset, CPU execution uses `16` for PP-OCRv6 Tiny and `4` for other
+    /// recognizers; explicitly configured accelerators retain their larger
+    /// throughput-oriented default.
+    pub fn region_batch_size(mut self, size: usize) -> Self {
+        self.region_batch_size = Some(size);
+        self
+    }
+
+    /// Adds document orientation detection to the pipeline.
+    ///
+    /// This component detects and corrects document rotation (0°, 90°, 180°, 270°).
+    /// Should be run before other processing for best results.
+    pub fn with_document_orientation(mut self, model_source: impl Into<ModelSource>) -> Self {
+        self.document_orientation_model = Some(model_source.into());
+        self
+    }
+
+    /// Adds document rectification to the pipeline.
+    ///
+    /// This component corrects document distortion and perspective issues.
+    /// Should be run after orientation detection if both are enabled.
+    pub fn with_document_rectification(mut self, model_source: impl Into<ModelSource>) -> Self {
+        self.document_rectification_model = Some(model_source.into());
+        self
+    }
+
+    /// Adds region detection to the pipeline (PP-DocBlockLayout).
+    ///
+    /// This component detects document regions (columns, blocks) for hierarchical
+    /// layout ordering. Region blocks provide grouping information for improved
+    /// reading order within multi-column or complex layouts.
+    ///
+    /// # PP-StructureV3 Integration
+    ///
+    /// When enabled, the pipeline uses region detection results to:
+    /// 1. Group layout elements by their parent regions
+    /// 2. Apply XY-cut ordering within each region
+    /// 3. Order regions based on their relative positions
+    pub fn with_region_detection(mut self, model_source: impl Into<ModelSource>) -> Self {
+        self.region_detection_model = Some(model_source.into());
+        self
+    }
+
+    /// Adds seal text detection to the pipeline.
+    ///
+    /// This component detects circular/curved seal and stamp text regions.
+    /// Seal regions will be included in the layout elements.
+    pub fn with_seal_text_detection(mut self, model_source: impl Into<ModelSource>) -> Self {
+        self.seal_text_detection_model = Some(model_source.into());
+        self
+    }
+
+    /// Adds table classification to the pipeline.
+    ///
+    /// This component classifies tables as wired or wireless.
+    pub fn with_table_classification(mut self, model_source: impl Into<ModelSource>) -> Self {
+        self.table_classification_model = Some(model_source.into());
+        self
+    }
+
+    /// Sets the table classification configuration.
+    pub fn table_classification_config(mut self, config: TableClassificationConfig) -> Self {
+        self.table_classification_config = Some(config);
+        self
+    }
+
+    /// Adds table orientation detection to the pipeline.
+    ///
+    /// This component detects if tables are rotated (0°, 90°, 180°, 270°) and corrects them
+    /// before structure recognition. Uses the same model as document orientation detection
+    /// (PP-LCNet_x1_0_doc_ori).
+    ///
+    /// # Arguments
+    ///
+    /// * `model_path` - Path to the orientation classification model (same as document orientation)
+    pub fn with_table_orientation(mut self, model_source: impl Into<ModelSource>) -> Self {
+        self.table_orientation_model = Some(model_source.into());
+        self
+    }
+
+    /// Sets whether to use end-to-end mode for wired table recognition.
+    ///
+    /// When enabled, cell detection model is skipped and only the table structure
+    /// recognition model's cell output is used. When disabled, RT-DETR cell detection
+    /// provides more precise cell bounding boxes.
+    ///
+    /// Default: `false` (use cell detection for wired tables)
+    pub fn use_e2e_wired_table_rec(mut self, enabled: bool) -> Self {
+        self.use_e2e_wired_table_rec = enabled;
+        self
+    }
+
+    /// Sets whether to use end-to-end mode for wireless table recognition.
+    ///
+    /// When enabled, cell detection model is skipped and only the table structure
+    /// recognition model's cell output is used. When disabled, RT-DETR cell detection
+    /// provides more precise cell bounding boxes.
+    ///
+    /// Default: `true` (E2E mode for wireless tables)
+    pub fn use_e2e_wireless_table_rec(mut self, enabled: bool) -> Self {
+        self.use_e2e_wireless_table_rec = enabled;
+        self
+    }
+
+    /// Enables PaddleX-compatible conversion of wired cell detections to HTML structure tokens.
+    ///
+    /// When enabled, wired tables can derive structure tokens directly from detected cell boxes,
+    /// which is useful for parity testing with PaddleX `use_wired_table_cells_trans_to_html`.
+    pub fn use_wired_table_cells_trans_to_html(mut self, enabled: bool) -> Self {
+        self.use_wired_table_cells_trans_to_html = enabled;
+        self
+    }
+
+    /// Enables PaddleX-compatible conversion of wireless cell detections to HTML structure tokens.
+    ///
+    /// When enabled, wireless tables can derive structure tokens directly from detected cell boxes,
+    /// which is useful for parity testing with PaddleX `use_wireless_table_cells_trans_to_html`.
+    pub fn use_wireless_table_cells_trans_to_html(mut self, enabled: bool) -> Self {
+        self.use_wireless_table_cells_trans_to_html = enabled;
+        self
+    }
+
+    /// Adds table cell detection to the pipeline.
+    ///
+    /// # Arguments
+    ///
+    /// * `model_path` - Path to the table cell detection model
+    /// * `cell_type` - `"wired"`, `"wireless"`, or the corresponding [`TableType`]
+    pub fn with_table_cell_detection(
+        mut self,
+        model_source: impl Into<ModelSource>,
+        cell_type: impl AsRef<str>,
+    ) -> Self {
+        self.table_cell_detection_model = Some(model_source.into());
+        self.table_cell_detection_type = Some(cell_type.as_ref().parse());
+        self
+    }
+
+    /// Sets the table cell detection configuration.
+    pub fn table_cell_detection_config(mut self, config: TableCellDetectionConfig) -> Self {
+        self.table_cell_detection_config = Some(config);
+        self
+    }
+
+    /// Adds table structure recognition to the pipeline.
+    ///
+    /// # Arguments
+    ///
+    /// * `model_path` - Path to the table structure recognition model
+    /// * `table_type` - `"wired"`, `"wireless"`, or the corresponding [`TableType`]
+    ///
+    /// This component recognizes the structure of tables and outputs HTML.
+    pub fn with_table_structure_recognition(
+        mut self,
+        model_source: impl Into<ModelSource>,
+        table_type: impl AsRef<str>,
+    ) -> Self {
+        self.table_structure_recognition_model = Some(model_source.into());
+        self.table_structure_recognition_type = Some(table_type.as_ref().parse());
+        self
+    }
+
+    /// Sets the dictionary path for table structure recognition.
+    ///
+    /// The dictionary file should match the model type:
+    /// - `table_structure_dict_ch.txt` for Chinese
+    /// - `table_structure_dict.txt` for English
+    /// - `table_master_structure_dict.txt` for extended tags
+    pub fn table_structure_dict_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.table_structure_dict_path = Some(path.into());
+        self
+    }
+
+    /// Sets the table structure recognition configuration.
+    pub fn table_structure_recognition_config(
+        mut self,
+        config: TableStructureRecognitionConfig,
+    ) -> Self {
+        self.table_structure_recognition_config = Some(config);
+        self
+    }
+
+    /// Adds wired table structure recognition model.
+    ///
+    /// When both wired and wireless models are configured along with table classification,
+    /// the system automatically selects the appropriate model based on classification results.
+    pub fn with_wired_table_structure(mut self, model_source: impl Into<ModelSource>) -> Self {
+        self.wired_table_structure_model = Some(model_source.into());
+        self
+    }
+
+    /// Adds wireless table structure recognition model.
+    ///
+    /// When both wired and wireless models are configured along with table classification,
+    /// the system automatically selects the appropriate model based on classification results.
+    pub fn with_wireless_table_structure(mut self, model_source: impl Into<ModelSource>) -> Self {
+        self.wireless_table_structure_model = Some(model_source.into());
+        self
+    }
+
+    /// Adds wired table cell detection model.
+    ///
+    /// When both wired and wireless models are configured along with table classification,
+    /// the system automatically selects the appropriate model based on classification results.
+    pub fn with_wired_table_cell_detection(mut self, model_source: impl Into<ModelSource>) -> Self {
+        self.wired_table_cell_model = Some(model_source.into());
+        self
+    }
+
+    /// Adds wireless table cell detection model.
+    ///
+    /// When both wired and wireless models are configured along with table classification,
+    /// the system automatically selects the appropriate model based on classification results.
+    pub fn with_wireless_table_cell_detection(
+        mut self,
+        model_source: impl Into<ModelSource>,
+    ) -> Self {
+        self.wireless_table_cell_model = Some(model_source.into());
+        self
+    }
+
+    /// Adds formula recognition to the pipeline.
+    ///
+    /// # Arguments
+    ///
+    /// * `model_path` - Path to the formula recognition model
+    /// * `tokenizer_path` - Path to the tokenizer JSON file
+    /// * `model_type` - `"pp_formulanet"`, `"unimernet"`, or the corresponding
+    ///   [`FormulaModelKind`]
+    ///
+    /// This component recognizes mathematical formulas and outputs LaTeX.
+    pub fn with_formula_recognition(
+        mut self,
+        model_source: impl Into<ModelSource>,
+        tokenizer_path: impl Into<PathBuf>,
+        model_type: impl AsRef<str>,
+    ) -> Self {
+        self.formula_recognition_model = Some(model_source.into());
+        self.formula_tokenizer_path = Some(tokenizer_path.into());
+        self.formula_recognition_type = Some(model_type.as_ref().parse());
+        self
+    }
+
+    /// Sets the formula recognition configuration.
+    pub fn formula_recognition_config(mut self, config: FormulaRecognitionConfig) -> Self {
+        self.formula_recognition_config = Some(config);
+        self
+    }
+
+    /// Sets an ONNX Runtime session configuration only for formula recognition.
+    pub fn formula_ort_session(mut self, config: OrtSessionConfig) -> Self {
+        self.formula_ort_session_config = Some(config);
+        self
+    }
+
+    /// Integrates OCR into the pipeline for text extraction.
+    ///
+    /// # Arguments
+    ///
+    /// * `text_detection_model` - Text detection model: a path or raw model bytes
+    /// * `text_recognition_model` - Text recognition model: a path or raw model bytes
+    /// * `character_dict_path` - Path to the character dictionary file
+    pub fn with_ocr(
+        mut self,
+        text_detection_model: impl Into<ModelSource>,
+        text_recognition_model: impl Into<ModelSource>,
+        character_dict_path: impl Into<PathBuf>,
+    ) -> Self {
+        self.text_detection_model = Some(text_detection_model.into());
+        self.text_recognition_model = Some(text_recognition_model.into());
+        self.character_dict_path = Some(character_dict_path.into());
+        self
+    }
+
+    /// Adds text line orientation detection to the OCR pipeline.
+    ///
+    /// This component detects whether text lines are upright (0°) or inverted (180°),
+    /// which helps improve OCR accuracy for documents with mixed text orientations.
+    ///
+    /// # PP-StructureV3 Integration
+    ///
+    /// When enabled, detected text lines are classified before recognition:
+    /// - Lines classified as 180° rotated are flipped before OCR
+    /// - This improves accuracy for documents scanned upside-down or with mixed orientations
+    pub fn with_text_line_orientation(mut self, model_source: impl Into<ModelSource>) -> Self {
+        self.text_line_orientation_model = Some(model_source.into());
+        self
+    }
+
+    /// Sets the text detection configuration.
+    pub fn text_detection_config(mut self, config: TextDetectionConfig) -> Self {
+        self.text_detection_config = Some(config);
+        self
+    }
+
+    /// Sets the text recognition configuration.
+    pub fn text_recognition_config(mut self, config: TextRecognitionConfig) -> Self {
+        self.text_recognition_config = Some(config);
+        self
+    }
+
+    /// Builds the structure analyzer runtime.
+    ///
+    /// This method instantiates all adapters and returns a ready-to-use structure analyzer.
+    pub fn build(mut self) -> Result<OARStructure, OCRError> {
+        for (component, selection) in [
+            ("table_cell_detection", &self.table_cell_detection_type),
+            (
+                "table_structure_recognition",
+                &self.table_structure_recognition_type,
+            ),
+        ] {
+            match selection {
+                Some(Err(message)) => {
+                    return Err(OCRError::config_error_detailed(component, message.clone()));
+                }
+                Some(Ok(TableType::Unknown)) => {
+                    return Err(OCRError::config_error_detailed(
+                        component,
+                        "'unknown' is not valid when selecting a table model".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if let Some(Err(message)) = self.formula_recognition_type.as_ref() {
+            return Err(OCRError::config_error_detailed(
+                "formula_recognition",
+                message.clone(),
+            ));
+        }
+
+        if let Some(size) = self.image_batch_size {
+            Self::validate_batch_size("image_batch_size", size)?;
+        }
+        if let Some(size) = self.region_batch_size {
+            Self::validate_batch_size("region_batch_size", size)?;
+        }
+
+        // PP-FormulaNet's CUDA autoregressive Loop races on EP arena buffers when
+        // its `session.run()`s interleave with other models' (onnxruntime#4829),
+        // garbling later formulas. The fix is `CUDA_LAUNCH_BLOCKING=1`, but it
+        // only takes effect if set before the first CUDA session is created — and
+        // here the formula adapter is built after ~10 other CUDA models. So set it
+        // up front whenever a formula model will run on CUDA.
+        if self.formula_recognition_model.is_some() {
+            use oar_ocr_core::core::config::OrtExecutionProvider;
+            let uses_cuda = self
+                .formula_ort_session_config
+                .as_ref()
+                .or(self.ort_session_config.as_ref())
+                .and_then(|cfg| cfg.execution_providers.as_ref())
+                .is_some_and(|eps| {
+                    eps.iter().any(|ep| {
+                        matches!(
+                            ep,
+                            OrtExecutionProvider::CUDA { .. }
+                                | OrtExecutionProvider::TensorRT { .. }
+                        )
+                    })
+                });
+            if uses_cuda {
+                oar_ocr_core::core::inference::ensure_cuda_launch_blocking();
+            }
+        }
+
+        // Resolve every model/dict/tokenizer path through the auto-download
+        // cache when the `auto-download` feature is enabled. With the feature
+        // off these calls are infallible no-ops.
+        self.layout_detection_model = resolve_model_source(&self.layout_detection_model)?;
+        fn resolve_opt_path(p: &mut Option<PathBuf>) -> Result<(), OCRError> {
+            if let Some(path) = p {
+                *path = resolve_model_path(path)?;
+            }
+            Ok(())
+        }
+        fn resolve_opt_source(s: &mut Option<ModelSource>) -> Result<(), OCRError> {
+            if let Some(source) = s {
+                *source = resolve_model_source(source)?;
+            }
+            Ok(())
+        }
+        resolve_opt_source(&mut self.document_orientation_model)?;
+        resolve_opt_source(&mut self.document_rectification_model)?;
+        resolve_opt_source(&mut self.region_detection_model)?;
+        resolve_opt_source(&mut self.table_classification_model)?;
+        resolve_opt_source(&mut self.table_orientation_model)?;
+        resolve_opt_source(&mut self.table_cell_detection_model)?;
+        resolve_opt_source(&mut self.table_structure_recognition_model)?;
+        resolve_opt_path(&mut self.table_structure_dict_path)?;
+        resolve_opt_source(&mut self.wired_table_structure_model)?;
+        resolve_opt_source(&mut self.wireless_table_structure_model)?;
+        resolve_opt_source(&mut self.wired_table_cell_model)?;
+        resolve_opt_source(&mut self.wireless_table_cell_model)?;
+        resolve_opt_source(&mut self.formula_recognition_model)?;
+        resolve_opt_path(&mut self.formula_tokenizer_path)?;
+        resolve_opt_source(&mut self.seal_text_detection_model)?;
+        resolve_opt_source(&mut self.text_detection_model)?;
+        resolve_opt_source(&mut self.text_line_orientation_model)?;
+        resolve_opt_source(&mut self.text_recognition_model)?;
+        resolve_opt_path(&mut self.character_dict_path)?;
+
+        let cpu_region_batch_size = default_cpu_region_batch_size(
+            self.text_recognition_model.as_ref(),
+            self.text_recognition_model_name.as_deref(),
+        );
+        (self.image_batch_size, self.region_batch_size) = resolve_device_batch_sizes(
+            self.ort_session_config.as_ref(),
+            self.image_batch_size,
+            self.region_batch_size,
+            1,
+            cpu_region_batch_size,
+        );
+
+        // Load character dictionary if OCR is enabled
+        let char_dict = if let Some(ref dict_path) = self.character_dict_path {
+            Some(
+                std::fs::read_to_string(dict_path).map_err(|e| OCRError::InvalidInput {
+                    message: format!(
+                        "Failed to read character dictionary from '{}': {}",
+                        dict_path.display(),
+                        e
+                    ),
+                })?,
+            )
+        } else {
+            None
+        };
+
+        // Build document orientation adapter if enabled
+        let document_orientation_adapter = build_optional_adapter(
+            self.document_orientation_model.as_ref(),
+            self.ort_session_config.as_ref(),
+            DocumentOrientationAdapterBuilder::new,
+        )?;
+
+        // Build document rectification adapter if enabled
+        let rectification_adapter = build_optional_adapter(
+            self.document_rectification_model.as_ref(),
+            self.ort_session_config.as_ref(),
+            UVDocRectifierAdapterBuilder::new,
+        )?;
+
+        // Build layout detection adapter (required)
+        let mut layout_builder = LayoutDetectionAdapterBuilder::new();
+
+        // Use explicit model name or default
+        let layout_model_config = if let Some(name) = &self.layout_model_name {
+            use oar_ocr_core::domain::adapters::LayoutModelConfig;
+            // Match presets case- and separator-insensitively so the documented
+            // forms (e.g. `PicoDet-L_layout_17cls`, `RT-DETR-H_layout_17cls`,
+            // `PP-DocLayout_plus-L`) resolve correctly. Mirrors the normalization
+            // used by `region_model_name` below.
+            match name.to_lowercase().replace('-', "_").as_str() {
+                "picodet_layout_1x" => LayoutModelConfig::picodet_layout_1x(),
+                "picodet_layout_1x_table" => LayoutModelConfig::picodet_layout_1x_table(),
+                "picodet_s_layout_3cls" => LayoutModelConfig::picodet_s_layout_3cls(),
+                "picodet_l_layout_3cls" => LayoutModelConfig::picodet_l_layout_3cls(),
+                "picodet_s_layout_17cls" => LayoutModelConfig::picodet_s_layout_17cls(),
+                "picodet_l_layout_17cls" => LayoutModelConfig::picodet_l_layout_17cls(),
+                "rt_detr_h_layout_3cls" => LayoutModelConfig::rtdetr_h_layout_3cls(),
+                "rt_detr_h_layout_17cls" => LayoutModelConfig::rtdetr_h_layout_17cls(),
+                "pp_docblocklayout" => LayoutModelConfig::pp_docblocklayout(),
+                "pp_doclayout_s" => LayoutModelConfig::pp_doclayout_s(),
+                "pp_doclayout_m" => LayoutModelConfig::pp_doclayout_m(),
+                "pp_doclayout_l" => LayoutModelConfig::pp_doclayout_l(),
+                "pp_doclayoutv3" | "pp_doclayout_v3" => LayoutModelConfig::pp_doclayoutv3(),
+                "pp_doclayout_plus_l" => LayoutModelConfig::pp_doclayout_plus_l(),
+                _ => {
+                    tracing::warn!(
+                        requested = %name,
+                        "Unknown --layout-model-name preset; falling back to PP-DocLayout_plus-L. \
+                         This may apply the wrong class labels/preprocessing for your model."
+                    );
+                    LayoutModelConfig::pp_doclayout_plus_l()
+                }
+            }
+        } else {
+            // Default fallback
+            crate::domain::adapters::LayoutModelConfig::pp_doclayout_plus_l()
+        };
+
+        layout_builder = layout_builder.model_config(layout_model_config);
+
+        // If caller didn't provide an explicit layout config, fall back to PP-StructureV3 defaults.
+        let effective_layout_cfg = self
+            .layout_detection_config
+            .clone()
+            .unwrap_or_else(LayoutDetectionConfig::with_pp_structurev3_defaults);
+        layout_builder = layout_builder.with_config(effective_layout_cfg);
+
+        if let Some(ref ort_config) = self.ort_session_config {
+            layout_builder = layout_builder.with_ort_config(ort_config.clone());
+        }
+
+        let layout_detection_adapter = layout_builder.build(&self.layout_detection_model)?;
+
+        // Build region detection adapter if enabled (PP-DocBlockLayout)
+        let region_detection_adapter = if let Some(ref model_path) = self.region_detection_model {
+            use oar_ocr_core::domain::adapters::LayoutModelConfig;
+            let mut region_builder = LayoutDetectionAdapterBuilder::new();
+
+            // Use model name to select configuration, default to PP-DocBlockLayout
+            let region_model_config = if let Some(ref name) = self.region_model_name {
+                match name.to_lowercase().replace("-", "_").as_str() {
+                    "pp_docblocklayout" => LayoutModelConfig::pp_docblocklayout(),
+                    _ => LayoutModelConfig::pp_docblocklayout(),
+                }
+            } else {
+                LayoutModelConfig::pp_docblocklayout()
+            };
+            region_builder = region_builder.model_config(region_model_config);
+
+            // PP-StructureV3 region detection uses merge_bboxes_mode="small".
+            let mut region_cfg = LayoutDetectionConfig::default();
+            let mut merge_modes = std::collections::HashMap::new();
+            merge_modes.insert(
+                "region".to_string(),
+                crate::domain::tasks::layout_detection::MergeBboxMode::Small,
+            );
+            region_cfg.class_merge_modes = Some(merge_modes);
+            region_builder = region_builder.with_config(region_cfg);
+
+            if let Some(ref ort_config) = self.ort_session_config {
+                region_builder = region_builder.with_ort_config(ort_config.clone());
+            }
+
+            Some(region_builder.build(model_path)?)
+        } else {
+            None
+        };
+
+        // Build table classification adapter if enabled
+        let table_classification_adapter =
+            if let Some(ref model_path) = self.table_classification_model {
+                let mut builder = TableClassificationAdapterBuilder::new();
+
+                if let Some(ref config) = self.table_classification_config {
+                    builder = builder.with_config(config.clone());
+                }
+
+                if let Some(ref ort_config) = self.ort_session_config {
+                    builder = builder.with_ort_config(ort_config.clone());
+                }
+
+                Some(builder.build(model_path)?)
+            } else {
+                None
+            };
+
+        // Build table orientation adapter if enabled (reuses document orientation model)
+        // This detects rotated tables (0°, 90°, 180°, 270°) before structure recognition
+        let table_orientation_adapter = build_optional_adapter(
+            self.table_orientation_model.as_ref(),
+            self.ort_session_config.as_ref(),
+            DocumentOrientationAdapterBuilder::new,
+        )?;
+
+        // Build table cell detection adapter if enabled
+        let table_cell_detection_adapter = if let Some(ref model_path) =
+            self.table_cell_detection_model
+        {
+            let cell_type = match self.table_cell_detection_type.as_ref() {
+                Some(Ok(cell_type)) => *cell_type,
+                Some(Err(message)) => {
+                    return Err(OCRError::config_error_detailed(
+                        "table_cell_detection",
+                        message.clone(),
+                    ));
+                }
+                None => TableType::Wired,
+            };
+
+            use oar_ocr_core::domain::adapters::table_cell_detection_adapter::TableCellModelConfig;
+
+            let model_config = match cell_type {
+                TableType::Wired => TableCellModelConfig::rtdetr_l_wired_table_cell_det(),
+                TableType::Wireless => TableCellModelConfig::rtdetr_l_wireless_table_cell_det(),
+                TableType::Unknown => {
+                    return Err(OCRError::config_error_detailed(
+                        "table_cell_detection",
+                        "TableType::Unknown is not valid for a table cell detector".to_string(),
+                    ));
+                }
+            };
+
+            let mut builder = TableCellDetectionAdapterBuilder::new().model_config(model_config);
+
+            if let Some(ref config) = self.table_cell_detection_config {
+                builder = builder.with_config(config.clone());
+            }
+
+            if let Some(ref ort_config) = self.ort_session_config {
+                builder = builder.with_ort_config(ort_config.clone());
+            }
+
+            Some(builder.build(model_path)?)
+        } else {
+            None
+        };
+
+        // Build table structure recognition adapter if enabled
+        let table_structure_recognition_adapter = if let Some(ref model_path) =
+            self.table_structure_recognition_model
+        {
+            let table_type = match self.table_structure_recognition_type.as_ref() {
+                Some(Ok(table_type)) => *table_type,
+                Some(Err(message)) => {
+                    return Err(OCRError::config_error_detailed(
+                        "table_structure_recognition",
+                        message.clone(),
+                    ));
+                }
+                None => TableType::Wired,
+            };
+            let dict_path = self
+                    .table_structure_dict_path
+                    .clone()
+                    .ok_or_else(|| {
+                        OCRError::config_error_detailed(
+                            "table_structure_recognition",
+                            "Dictionary path is required. Call table_structure_dict_path() when enabling table structure recognition.".to_string(),
+                        )
+                    })?;
+
+            let adapter: TableStructureRecognitionAdapter = match table_type {
+                TableType::Wired => {
+                    let mut builder = SLANetWiredAdapterBuilder::new().dict_path(dict_path.clone());
+
+                    if let Some(ref config) = self.table_structure_recognition_config {
+                        builder = builder.with_config(config.clone());
+                    }
+
+                    if let Some(ref ort_config) = self.ort_session_config {
+                        builder = builder.with_ort_config(ort_config.clone());
+                    }
+
+                    builder.build(model_path)?
+                }
+                TableType::Wireless => {
+                    let mut builder =
+                        SLANetWirelessAdapterBuilder::new().dict_path(dict_path.clone());
+
+                    if let Some(ref config) = self.table_structure_recognition_config {
+                        builder = builder.with_config(config.clone());
+                    }
+
+                    if let Some(ref ort_config) = self.ort_session_config {
+                        builder = builder.with_ort_config(ort_config.clone());
+                    }
+
+                    builder.build(model_path)?
+                }
+                TableType::Unknown => {
+                    return Err(OCRError::config_error_detailed(
+                        "table_structure_recognition",
+                        "TableType::Unknown is not valid for table structure recognition"
+                            .to_string(),
+                    ));
+                }
+            };
+
+            Some(adapter)
+        } else {
+            None
+        };
+
+        // Build wired/wireless table structure adapters for auto-switch (PP-StructureV3)
+        let wired_table_structure_adapter = if let Some(ref model_path) =
+            self.wired_table_structure_model
+        {
+            let dict_path = self.table_structure_dict_path.clone().ok_or_else(|| {
+                OCRError::config_error_detailed(
+                    "wired_table_structure",
+                    "Dictionary path is required. Call table_structure_dict_path() when enabling table structure recognition.".to_string(),
+                )
+            })?;
+
+            let mut builder = SLANetWiredAdapterBuilder::new().dict_path(dict_path);
+
+            // Label the model in logs/errors with the caller-provided preset name
+            // (e.g. `SLANeXt_wired`). The wired/wireless slot already fixes the
+            // SLANet variant's input shape, so this is identification metadata.
+            if let Some(ref name) = self.wired_table_structure_model_name {
+                builder = builder.model_name(name.clone());
+            }
+
+            if let Some(ref config) = self.table_structure_recognition_config {
+                builder = builder.with_config(config.clone());
+            }
+
+            if let Some(ref ort_config) = self.ort_session_config {
+                builder = builder.with_ort_config(ort_config.clone());
+            }
+
+            Some(builder.build(model_path)?)
+        } else {
+            None
+        };
+
+        let wireless_table_structure_adapter = if let Some(ref model_path) =
+            self.wireless_table_structure_model
+        {
+            let dict_path = self.table_structure_dict_path.clone().ok_or_else(|| {
+                OCRError::config_error_detailed(
+                    "wireless_table_structure",
+                    "Dictionary path is required. Call table_structure_dict_path() when enabling table structure recognition.".to_string(),
+                )
+            })?;
+
+            let mut builder = SLANetWirelessAdapterBuilder::new().dict_path(dict_path);
+
+            if let Some(ref name) = self.wireless_table_structure_model_name {
+                builder = builder.model_name(name.clone());
+            }
+
+            if let Some(ref config) = self.table_structure_recognition_config {
+                builder = builder.with_config(config.clone());
+            }
+
+            if let Some(ref ort_config) = self.ort_session_config {
+                builder = builder.with_ort_config(ort_config.clone());
+            }
+
+            Some(builder.build(model_path)?)
+        } else {
+            None
+        };
+
+        // Build wired/wireless table cell detection adapters for auto-switch
+        let wired_table_cell_adapter = if let Some(ref model_path) = self.wired_table_cell_model {
+            use oar_ocr_core::domain::adapters::table_cell_detection_adapter::TableCellModelConfig;
+
+            let mut model_config = TableCellModelConfig::rtdetr_l_wired_table_cell_det();
+            // Honor the caller-provided preset name for model identification.
+            if let Some(ref name) = self.wired_table_cell_model_name {
+                model_config.model_name = name.clone();
+            }
+            let mut builder = TableCellDetectionAdapterBuilder::new().model_config(model_config);
+
+            if let Some(ref config) = self.table_cell_detection_config {
+                builder = builder.with_config(config.clone());
+            }
+
+            if let Some(ref ort_config) = self.ort_session_config {
+                builder = builder.with_ort_config(ort_config.clone());
+            }
+
+            Some(builder.build(model_path)?)
+        } else {
+            None
+        };
+
+        let wireless_table_cell_adapter = if let Some(ref model_path) =
+            self.wireless_table_cell_model
+        {
+            use oar_ocr_core::domain::adapters::table_cell_detection_adapter::TableCellModelConfig;
+
+            let mut model_config = TableCellModelConfig::rtdetr_l_wireless_table_cell_det();
+            if let Some(ref name) = self.wireless_table_cell_model_name {
+                model_config.model_name = name.clone();
+            }
+            let mut builder = TableCellDetectionAdapterBuilder::new().model_config(model_config);
+
+            if let Some(ref config) = self.table_cell_detection_config {
+                builder = builder.with_config(config.clone());
+            }
+
+            if let Some(ref ort_config) = self.ort_session_config {
+                builder = builder.with_ort_config(ort_config.clone());
+            }
+
+            Some(builder.build(model_path)?)
+        } else {
+            None
+        };
+
+        // Build formula recognition adapter if enabled
+        let formula_recognition_adapter =
+            if let Some(ref model_path) = self.formula_recognition_model {
+                let tokenizer_path = self.formula_tokenizer_path.as_ref().ok_or_else(|| {
+                    OCRError::config_error_detailed(
+                        "formula_recognition",
+                        "Tokenizer path is required for formula recognition".to_string(),
+                    )
+                })?;
+
+                let model_type = match self.formula_recognition_type.as_ref() {
+                    Some(Ok(model_type)) => *model_type,
+                    Some(Err(message)) => {
+                        return Err(OCRError::config_error_detailed(
+                            "formula_recognition",
+                            message.clone(),
+                        ));
+                    }
+                    None => {
+                        return Err(OCRError::config_error_detailed(
+                            "formula_recognition",
+                            "Formula model kind is required".to_string(),
+                        ));
+                    }
+                };
+
+                let adapter: FormulaRecognitionAdapter = match model_type {
+                    FormulaModelKind::PPFormulaNet => {
+                        let mut builder = PPFormulaNetAdapterBuilder::new();
+
+                        builder = builder.tokenizer_path(tokenizer_path);
+
+                        if let Some(ref config) = self.formula_recognition_config {
+                            builder = builder.task_config(config.clone());
+                        }
+
+                        if let Some(ort_config) = self
+                            .formula_ort_session_config
+                            .as_ref()
+                            .or(self.ort_session_config.as_ref())
+                        {
+                            builder = builder.with_ort_config(ort_config.clone());
+                        }
+
+                        builder.build(model_path)?
+                    }
+                    FormulaModelKind::UniMERNet => {
+                        let mut builder = UniMERNetAdapterBuilder::new();
+
+                        builder = builder.tokenizer_path(tokenizer_path);
+
+                        if let Some(ref config) = self.formula_recognition_config {
+                            builder = builder.task_config(config.clone());
+                        }
+
+                        if let Some(ort_config) = self
+                            .formula_ort_session_config
+                            .as_ref()
+                            .or(self.ort_session_config.as_ref())
+                        {
+                            builder = builder.with_ort_config(ort_config.clone());
+                        }
+
+                        builder.build(model_path)?
+                    }
+                };
+
+                Some(adapter)
+            } else {
+                None
+            };
+
+        // Build seal text detection adapter if enabled
+        let seal_text_detection_adapter =
+            if let Some(ref model_path) = self.seal_text_detection_model {
+                let mut builder = SealTextDetectionAdapterBuilder::new();
+
+                if let Some(ref ort_config) = self.ort_session_config {
+                    builder = builder.with_ort_config(ort_config.clone());
+                }
+
+                Some(builder.build(model_path)?)
+            } else {
+                None
+            };
+
+        // Build text detection adapter if enabled.
+        //
+        // PP-StructureV3 overall OCR uses DB preprocess with:
+        // - limit_side_len=736
+        // - limit_type="min"
+        // - max_side_limit=4000
+        // We fill these defaults here (only for the structure pipeline) unless the caller
+        // explicitly overrides them via `text_detection_config`.
+        let text_detection_adapter = if let Some(ref model_path) = self.text_detection_model {
+            let mut builder = TextDetectionAdapterBuilder::new();
+
+            let mut effective_cfg = self.text_detection_config.clone().unwrap_or_default();
+
+            // Table-heavy documents are sensitive to detection fragmentation.
+            // Match PaddleX's lower table-scene threshold when users don't override config.
+            let has_table_pipeline = self.table_classification_model.is_some()
+                || self.table_structure_recognition_model.is_some()
+                || self.wired_table_structure_model.is_some()
+                || self.wireless_table_structure_model.is_some()
+                || self.table_cell_detection_model.is_some()
+                || self.wired_table_cell_model.is_some()
+                || self.wireless_table_cell_model.is_some();
+            if self.text_detection_config.is_none() && has_table_pipeline {
+                effective_cfg.box_threshold = 0.4;
+            }
+
+            if effective_cfg.limit_side_len.is_none() {
+                effective_cfg.limit_side_len = Some(736);
+            }
+            if effective_cfg.limit_type.is_none() {
+                effective_cfg.limit_type = Some(crate::processors::LimitType::Min);
+            }
+            if effective_cfg.max_side_len.is_none() {
+                effective_cfg.max_side_len = Some(4000);
+            }
+            builder = builder.with_config(effective_cfg);
+
+            // Label the detector with the caller-provided preset name (e.g.
+            // `PP-OCRv5_server_det`) for logs/errors. Detection behavior is
+            // driven by the config and ONNX model, not the name.
+            if let Some(ref name) = self.text_detection_model_name {
+                builder = builder.model_name(name.clone());
+            }
+
+            if let Some(ref ort_config) = self.ort_session_config {
+                builder = builder.with_ort_config(ort_config.clone());
+            }
+
+            Some(builder.build(model_path)?)
+        } else {
+            None
+        };
+
+        // Build text line orientation adapter if enabled (PP-StructureV3)
+        let text_line_orientation_adapter =
+            if let Some(ref model_path) = self.text_line_orientation_model {
+                let mut builder = TextLineOrientationAdapterBuilder::new();
+
+                if let Some(ref ort_config) = self.ort_session_config {
+                    builder = builder.with_ort_config(ort_config.clone());
+                }
+
+                Some(builder.build(model_path)?)
+            } else {
+                None
+            };
+
+        // Build text recognition adapter if enabled
+        let text_recognition_adapter = if let Some(ref model_path) = self.text_recognition_model {
+            let dict = char_dict.ok_or_else(|| OCRError::InvalidInput {
+                message: "Character dictionary is required for text recognition".to_string(),
+            })?;
+
+            // Parse dict into Vec<String> - one character per line
+            let char_vec: Vec<String> = dict.lines().map(|s| s.to_string()).collect();
+
+            let mut builder = TextRecognitionAdapterBuilder::new().character_dict(char_vec);
+
+            if let Some(ref config) = self.text_recognition_config {
+                builder = builder.with_config(config.clone());
+            }
+
+            // Label the recognizer with the caller-provided preset name (e.g.
+            // `PP-OCRv5_server_rec`) for logs/errors. Recognition behavior is
+            // driven by the config, dictionary, and ONNX model, not the name.
+            if let Some(ref name) = self.text_recognition_model_name {
+                builder = builder.model_name(name.clone());
+            }
+
+            if let Some(ref ort_config) = self.ort_session_config {
+                builder = builder.with_ort_config(ort_config.clone());
+            }
+
+            Some(builder.build(model_path)?)
+        } else {
+            None
+        };
+
+        let pipeline = StructurePipeline {
+            document_orientation_adapter,
+            rectification_adapter,
+            layout_detection_adapter,
+            region_detection_adapter,
+            table_classification_adapter,
+            table_orientation_adapter,
+            table_cell_detection_adapter,
+            table_structure_recognition_adapter,
+            wired_table_structure_adapter,
+            wireless_table_structure_adapter,
+            wired_table_cell_adapter,
+            wireless_table_cell_adapter,
+            use_e2e_wired_table_rec: self.use_e2e_wired_table_rec,
+            use_e2e_wireless_table_rec: self.use_e2e_wireless_table_rec,
+            use_wired_table_cells_trans_to_html: self.use_wired_table_cells_trans_to_html,
+            use_wireless_table_cells_trans_to_html: self.use_wireless_table_cells_trans_to_html,
+            formula_recognition_adapter,
+            seal_text_detection_adapter,
+            text_detection_adapter,
+            text_line_orientation_adapter,
+            text_recognition_adapter,
+            image_batch_size: self.image_batch_size,
+            region_batch_size: self.region_batch_size,
+        };
+
+        Ok(OARStructure { pipeline })
+    }
+
+    fn validate_batch_size(field: &str, size: usize) -> Result<(), OCRError> {
+        if size == 0 || size > Self::MAX_BATCH_SIZE {
+            return Err(OCRError::validation_error(
+                "OARStructureBuilder",
+                field,
+                &format!("1..={}", Self::MAX_BATCH_SIZE),
+                &size.to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// Runtime for document structure analysis.
+///
+/// This struct represents a configured and ready-to-use document structure analyzer.
+#[derive(Debug)]
+pub struct OARStructure {
+    pipeline: StructurePipeline,
+}
+
+/// Intermediate result from preprocessing and layout detection for a single page.
+/// Produced by `OARStructure::prepare_page` and consumed by `complete_page`.
+struct PreparedPage {
+    current_image: std::sync::Arc<image::RgbImage>,
+    orientation_angle: Option<f32>,
+    rectified_img: Option<std::sync::Arc<image::RgbImage>>,
+    rotation: Option<crate::oarocr::preprocess::OrientationCorrection>,
+    layout_elements: Vec<crate::domain::structure::LayoutElement>,
+    detected_region_blocks: Option<Vec<crate::domain::structure::RegionBlock>>,
+    precomputed_text_regions: Option<Vec<crate::oarocr::TextRegion>>,
+}
+
+impl OARStructure {
+    fn finish_layout_elements(layout_elements: &mut Vec<crate::domain::structure::LayoutElement>) {
+        if layout_elements.len() > 1 {
+            let removed = crate::domain::structure::remove_overlapping_layout_elements(
+                layout_elements,
+                LAYOUT_OVERLAP_IOU_THRESHOLD,
+            );
+            if removed > 0 {
+                tracing::info!(
+                    "Removing {} overlapping layout elements (threshold={})",
+                    removed,
+                    LAYOUT_OVERLAP_IOU_THRESHOLD
+                );
+            }
+        }
+
+        crate::domain::structure::apply_standardized_layout_label_fixes(layout_elements);
+    }
+
+    fn layout_elements_from_detection(
+        elements: &[oar_ocr_core::domain::tasks::LayoutDetectionElement],
+    ) -> Vec<crate::domain::structure::LayoutElement> {
+        use oar_ocr_core::domain::structure::LayoutElementType;
+
+        elements
+            .iter()
+            .map(|element| {
+                let element_type_enum = LayoutElementType::from_label(&element.element_type);
+                crate::domain::structure::LayoutElement::new(
+                    element.bbox.clone(),
+                    element_type_enum,
+                    element.score,
+                )
+                .with_label(element.element_type.clone())
+            })
+            .collect()
+    }
+
+    /// Refinement of overall OCR results using layout boxes.
+    ///
+    /// This mirrors two behaviors in `layout_parsing/pipeline_v2.py`:
+    /// 1) If a single overall OCR box overlaps multiple layout blocks, re-recognize
+    ///    the intersection crop per block and replace/append OCR entries.
+    /// 2) If a non-vision layout block has no matched OCR text, run recognition
+    ///    on the layout bbox crop as a fallback.
+    ///
+    /// We approximate poly handling with AABB intersections. The resulting
+    /// crops are stored into `TextRegion` with `dt_poly/rec_poly` set to the crop box.
+    fn refine_overall_ocr_with_layout(
+        text_regions: &mut Vec<crate::oarocr::TextRegion>,
+        layout_elements: &[crate::domain::structure::LayoutElement],
+        region_blocks: Option<&[crate::domain::structure::RegionBlock]>,
+        page_image: &image::RgbImage,
+        text_recognition_adapter: &TextRecognitionAdapter,
+        region_batch_size: usize,
+    ) -> Result<(), OCRError> {
+        use oar_ocr_core::core::traits::task::ImageTaskInput;
+        use oar_ocr_core::domain::structure::LayoutElementType;
+        use oar_ocr_core::processors::BoundingBox;
+        use oar_ocr_core::utils::BBoxCrop;
+
+        if text_regions.is_empty() || layout_elements.is_empty() {
+            return Ok(());
+        }
+
+        fn aabb_intersection(b1: &BoundingBox, b2: &BoundingBox) -> Option<BoundingBox> {
+            let x1 = b1.x_min().max(b2.x_min());
+            let y1 = b1.y_min().max(b2.y_min());
+            let x2 = b1.x_max().min(b2.x_max());
+            let y2 = b1.y_max().min(b2.y_max());
+            if x2 - x1 <= 1.0 || y2 - y1 <= 1.0 {
+                None
+            } else {
+                Some(BoundingBox::from_coords(x1, y1, x2, y2))
+            }
+        }
+
+        // Layout boxes that participate in OCR matching (exclude specialized types).
+        let is_excluded_layout = |t: LayoutElementType| {
+            matches!(
+                t,
+                LayoutElementType::Formula
+                    | LayoutElementType::FormulaNumber
+                    | LayoutElementType::Table
+                    | LayoutElementType::Seal
+            )
+        };
+
+        // Build overlap maps: ocr_idx -> layout_idxes.
+        // `get_sub_regions_ocr_res` uses get_overlap_boxes_idx:
+        // any overlap with intersection width/height >3px counts as a match (no ratio threshold).
+        let min_pixels = 3.0;
+        let mut matched_ocr: Vec<Vec<usize>> = vec![Vec::new(); text_regions.len()];
+        for (ocr_idx, region) in text_regions.iter().enumerate() {
+            for (layout_idx, elem) in layout_elements.iter().enumerate() {
+                if is_excluded_layout(elem.element_type) {
+                    continue;
+                }
+                let inter_x_min = region.bounding_box.x_min().max(elem.bbox.x_min());
+                let inter_y_min = region.bounding_box.y_min().max(elem.bbox.y_min());
+                let inter_x_max = region.bounding_box.x_max().min(elem.bbox.x_max());
+                let inter_y_max = region.bounding_box.y_max().min(elem.bbox.y_max());
+                if inter_x_max - inter_x_min > min_pixels && inter_y_max - inter_y_min > min_pixels
+                {
+                    matched_ocr[ocr_idx].push(layout_idx);
+                }
+            }
+        }
+
+        // 1) Cross-layout re-recognition for OCR boxes matched to multiple blocks.
+        let mut appended_regions: Vec<crate::oarocr::TextRegion> = Vec::new();
+        let original_ocr_len = text_regions.len();
+        let mut multi_layout_ocr_count = 0usize;
+        let mut multi_layout_crop_count = 0usize;
+
+        for ocr_idx in 0..original_ocr_len {
+            let layout_ids = matched_ocr[ocr_idx].clone();
+            if layout_ids.len() <= 1 {
+                continue;
+            }
+            multi_layout_ocr_count += 1;
+
+            let ocr_box = text_regions[ocr_idx].bounding_box.clone();
+
+            let mut crops: Vec<image::RgbImage> = Vec::new();
+            let mut crop_boxes: Vec<(BoundingBox, bool)> = Vec::new(); // (bbox, is_first)
+
+            for (j, layout_idx) in layout_ids.iter().enumerate() {
+                let layout_box = &layout_elements[*layout_idx].bbox;
+                let Some(crop_box) = aabb_intersection(&ocr_box, layout_box) else {
+                    continue;
+                };
+
+                // Suppress existing OCR text fully covered by this crop (IoU > 0.8).
+                for (other_idx, other_region) in text_regions.iter_mut().enumerate() {
+                    if other_idx == ocr_idx {
+                        continue;
+                    }
+                    if other_region.bounding_box.iou(&crop_box) > 0.8 {
+                        other_region.text = None;
+                    }
+                }
+
+                if let Ok(crop_img) = BBoxCrop::crop_bounding_box(page_image, &crop_box) {
+                    crops.push(crop_img);
+                    crop_boxes.push((crop_box, j == 0));
+                }
+            }
+            multi_layout_crop_count += crop_boxes.len();
+
+            if crops.is_empty() {
+                continue;
+            }
+
+            // Run recognition on all crops (batched).
+            let mut rec_texts: Vec<String> = Vec::with_capacity(crops.len());
+            let mut rec_scores: Vec<f32> = Vec::with_capacity(crops.len());
+
+            for batch_start in (0..crops.len()).step_by(region_batch_size.max(1)) {
+                let batch_end = (batch_start + region_batch_size).min(crops.len());
+                let batch: Vec<_> = crops[batch_start..batch_end].to_vec();
+                let rec_input = ImageTaskInput::new(batch);
+                let rec_result = text_recognition_adapter.execute(rec_input, None)?;
+                rec_texts.extend(rec_result.texts);
+                rec_scores.extend(rec_result.scores);
+            }
+
+            for ((crop_box, is_first), (text, score)) in crop_boxes
+                .into_iter()
+                .zip(rec_texts.into_iter().zip(rec_scores))
+            {
+                if text.is_empty() {
+                    continue;
+                }
+                if is_first {
+                    text_regions[ocr_idx].bounding_box = crop_box.clone();
+                    text_regions[ocr_idx].dt_poly = Some(crop_box.clone());
+                    text_regions[ocr_idx].rec_poly = Some(crop_box.clone());
+                    text_regions[ocr_idx].text = Some(Arc::from(text));
+                    text_regions[ocr_idx].confidence = Some(score);
+                } else {
+                    appended_regions.push(crate::oarocr::TextRegion {
+                        bounding_box: crop_box.clone(),
+                        dt_poly: Some(crop_box.clone()),
+                        rec_poly: Some(crop_box),
+                        text: Some(Arc::from(text)),
+                        confidence: Some(score),
+                        orientation_angle: None,
+                        word_boxes: None,
+                        label: None,
+                    });
+                }
+            }
+        }
+
+        if !appended_regions.is_empty() {
+            text_regions.extend(appended_regions);
+        }
+
+        // 2) Layout-bbox fallback OCR for blocks with no matched text.
+        // Prefer region blocks for hierarchy if present, but OCR fallback is driven by layout boxes.
+        let mut fallback_blocks = 0usize;
+        for elem in layout_elements.iter() {
+            if is_excluded_layout(elem.element_type) {
+                continue;
+            }
+            if matches!(
+                elem.element_type,
+                LayoutElementType::Image | LayoutElementType::Chart
+            ) {
+                continue;
+            }
+
+            let mut has_text = false;
+            for region in text_regions.iter() {
+                if !region.text.as_ref().map(|t| !t.is_empty()).unwrap_or(false) {
+                    continue;
+                }
+                let inter_x_min = region.bounding_box.x_min().max(elem.bbox.x_min());
+                let inter_y_min = region.bounding_box.y_min().max(elem.bbox.y_min());
+                let inter_x_max = region.bounding_box.x_max().min(elem.bbox.x_max());
+                let inter_y_max = region.bounding_box.y_max().min(elem.bbox.y_max());
+                if inter_x_max - inter_x_min > min_pixels && inter_y_max - inter_y_min > min_pixels
+                {
+                    has_text = true;
+                    break;
+                }
+            }
+
+            if has_text {
+                continue;
+            }
+            fallback_blocks += 1;
+
+            // Crop layout bbox and run recognition.
+            if let Ok(crop_img) = BBoxCrop::crop_bounding_box(page_image, &elem.bbox) {
+                let rec_input = ImageTaskInput::new(vec![crop_img]);
+                let rec_result = text_recognition_adapter.execute(rec_input, None)?;
+                if let (Some(text), Some(score)) =
+                    (rec_result.texts.first(), rec_result.scores.first())
+                    && !text.is_empty()
+                {
+                    let crop_box = elem.bbox.clone();
+                    text_regions.push(crate::oarocr::TextRegion {
+                        bounding_box: crop_box.clone(),
+                        dt_poly: Some(crop_box.clone()),
+                        rec_poly: Some(crop_box),
+                        text: Some(Arc::from(text.as_str())),
+                        confidence: Some(*score),
+                        orientation_angle: None,
+                        word_boxes: None,
+                        label: None,
+                    });
+                }
+            }
+        }
+
+        tracing::info!(
+            "overall OCR refine: multi-layout OCR boxes={}, crops={}, fallback layout blocks={}",
+            multi_layout_ocr_count,
+            multi_layout_crop_count,
+            fallback_blocks
+        );
+
+        // Region blocks currently do not require special handling here; they are only
+        // used for ordering later. Kept as a parameter for future parity work.
+        let _ = region_blocks;
+
+        Ok(())
+    }
+
+    /// Split OCR bounding boxes based on table cell boundaries when they span multiple cells.
+    ///
+    /// This mirrors `split_ocr_bboxes_by_table_cells`:
+    /// - For each OCR box that overlaps >= k cells (by intersection / cell_area > 0.5),
+    ///   split the box vertically at cell boundaries
+    /// - Re-run text recognition on each split crop
+    /// - Replace the original OCR box/text with the split boxes/texts
+    fn split_ocr_bboxes_by_table_cells(
+        tables: &[TableResult],
+        text_regions: &mut Vec<crate::oarocr::TextRegion>,
+        page_image: &image::RgbImage,
+        text_recognition_adapter: &TextRecognitionAdapter,
+    ) -> Result<(), OCRError> {
+        use oar_ocr_core::core::traits::task::ImageTaskInput;
+        use oar_ocr_core::processors::BoundingBox;
+
+        // Collect all cell boxes in [x1, y1, x2, y2] format
+        let mut cell_boxes: Vec<[f32; 4]> = Vec::new();
+        for table in tables {
+            for cell in &table.cells {
+                let x1 = cell.bbox.x_min();
+                let y1 = cell.bbox.y_min();
+                let x2 = cell.bbox.x_max();
+                let y2 = cell.bbox.y_max();
+                if x2 > x1 && y2 > y1 {
+                    cell_boxes.push([x1, y1, x2, y2]);
+                }
+            }
+        }
+
+        if cell_boxes.is_empty() || text_regions.is_empty() {
+            return Ok(());
+        }
+
+        // Calculate intersection / cell_area (matches calculate_iou in split_ocr_bboxes_by_table_cells)
+        fn overlap_ratio_box_over_cell(box1: &[f32; 4], box2: &[f32; 4]) -> f32 {
+            let x_left = box1[0].max(box2[0]);
+            let y_top = box1[1].max(box2[1]);
+            let x_right = box1[2].min(box2[2]);
+            let y_bottom = box1[3].min(box2[3]);
+
+            if x_right <= x_left || y_bottom <= y_top {
+                return 0.0;
+            }
+
+            let inter_area = (x_right - x_left) * (y_bottom - y_top);
+            let cell_area = (box2[2] - box2[0]) * (box2[3] - box2[1]);
+            if cell_area <= 0.0 {
+                0.0
+            } else {
+                inter_area / cell_area
+            }
+        }
+
+        // Find cells that significantly overlap with an OCR box
+        fn get_overlapping_cells(
+            ocr_box: &[f32; 4],
+            cells: &[[f32; 4]],
+            threshold: f32,
+        ) -> Vec<usize> {
+            let mut overlapping = Vec::new();
+            for (idx, cell) in cells.iter().enumerate() {
+                if overlap_ratio_box_over_cell(ocr_box, cell) > threshold {
+                    overlapping.push(idx);
+                }
+            }
+            // Sort by cell x1 (left to right)
+            overlapping.sort_by(|&i, &j| {
+                cells[i][0]
+                    .partial_cmp(&cells[j][0])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            overlapping
+        }
+
+        // Split an OCR box vertically at cell boundaries.
+        fn split_box_by_cells(
+            ocr_box: &[f32; 4],
+            cell_indices: &[usize],
+            cells: &[[f32; 4]],
+        ) -> Vec<[f32; 4]> {
+            if cell_indices.is_empty() {
+                return vec![*ocr_box];
+            }
+
+            let mut split_boxes: Vec<[f32; 4]> = Vec::new();
+            let cells_to_split: Vec<[f32; 4]> = cell_indices.iter().map(|&i| cells[i]).collect();
+
+            // Leading segment before first cell
+            if ocr_box[0] < cells_to_split[0][0] {
+                split_boxes.push([ocr_box[0], ocr_box[1], cells_to_split[0][0], ocr_box[3]]);
+            }
+
+            // Segments overlapping each cell and gaps between cells
+            for (i, current_cell) in cells_to_split.iter().enumerate() {
+                // Cell overlap segment
+                split_boxes.push([
+                    ocr_box[0].max(current_cell[0]),
+                    ocr_box[1],
+                    ocr_box[2].min(current_cell[2]),
+                    ocr_box[3],
+                ]);
+
+                // Gap between this cell and the next cell
+                if i + 1 < cells_to_split.len() {
+                    let next_cell = cells_to_split[i + 1];
+                    if current_cell[2] < next_cell[0] {
+                        split_boxes.push([current_cell[2], ocr_box[1], next_cell[0], ocr_box[3]]);
+                    }
+                }
+            }
+
+            // Trailing segment after last cell
+            let last_cell = cells_to_split[cells_to_split.len() - 1];
+            if last_cell[2] < ocr_box[2] {
+                split_boxes.push([last_cell[2], ocr_box[1], ocr_box[2], ocr_box[3]]);
+            }
+
+            // Deduplicate boxes
+            let mut unique = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for b in split_boxes {
+                let key = (
+                    b[0].to_bits(),
+                    b[1].to_bits(),
+                    b[2].to_bits(),
+                    b[3].to_bits(),
+                );
+                if seen.insert(key) {
+                    unique.push(b);
+                }
+            }
+            unique
+        }
+
+        let k_min_cells = 2usize;
+        let overlap_threshold = CELL_OVERLAP_IOU_THRESHOLD;
+
+        let mut new_regions: Vec<crate::oarocr::TextRegion> =
+            Vec::with_capacity(text_regions.len());
+
+        for region in text_regions.iter() {
+            let ocr_box = [
+                region.bounding_box.x_min(),
+                region.bounding_box.y_min(),
+                region.bounding_box.x_max(),
+                region.bounding_box.y_max(),
+            ];
+
+            let overlapping_cells = get_overlapping_cells(&ocr_box, &cell_boxes, overlap_threshold);
+
+            // If OCR box does not span multiple cells, keep as-is
+            if overlapping_cells.len() < k_min_cells {
+                new_regions.push(region.clone());
+                continue;
+            }
+
+            let split_boxes = split_box_by_cells(&ocr_box, &overlapping_cells, &cell_boxes);
+
+            for box_coords in split_boxes {
+                // Convert to integer crop coordinates, clamp to image bounds
+                let img_w = page_image.width() as i32;
+                let img_h = page_image.height() as i32;
+
+                let mut x1 = box_coords[0].floor() as i32;
+                let mut y1 = box_coords[1].floor() as i32;
+                let mut x2 = box_coords[2].ceil() as i32;
+                let mut y2 = box_coords[3].ceil() as i32;
+
+                x1 = x1.clamp(0, img_w.saturating_sub(1));
+                y1 = y1.clamp(0, img_h.saturating_sub(1));
+                x2 = x2.clamp(0, img_w);
+                y2 = y2.clamp(0, img_h);
+
+                if x2 - x1 <= 1 || y2 - y1 <= 1 {
+                    continue;
+                }
+
+                let crop_w = (x2 - x1) as u32;
+                let crop_h = (y2 - y1) as u32;
+                if crop_w <= 1 || crop_h <= 1 {
+                    continue;
+                }
+
+                let x1u = x1 as u32;
+                let y1u = y1 as u32;
+                if x1u >= page_image.width() || y1u >= page_image.height() {
+                    continue;
+                }
+                let crop_w = crop_w.min(page_image.width() - x1u);
+                let crop_h = crop_h.min(page_image.height() - y1u);
+                if crop_w <= 1 || crop_h <= 1 {
+                    continue;
+                }
+
+                let crop =
+                    image::imageops::crop_imm(page_image, x1u, y1u, crop_w, crop_h).to_image();
+
+                let rec_input = ImageTaskInput::new(vec![crop]);
+                let rec_result = text_recognition_adapter.execute(rec_input, None)?;
+                if let (Some(text), Some(score)) =
+                    (rec_result.texts.first(), rec_result.scores.first())
+                    && !text.is_empty()
+                {
+                    let bbox = BoundingBox::from_coords(
+                        box_coords[0],
+                        box_coords[1],
+                        box_coords[2],
+                        box_coords[3],
+                    );
+                    new_regions.push(crate::oarocr::TextRegion {
+                        bounding_box: bbox.clone(),
+                        dt_poly: Some(bbox.clone()),
+                        rec_poly: Some(bbox),
+                        text: Some(Arc::from(text.as_str())),
+                        confidence: Some(*score),
+                        orientation_angle: None,
+                        word_boxes: None,
+                        label: None,
+                    });
+                }
+            }
+        }
+
+        *text_regions = new_regions;
+        Ok(())
+    }
+
+    fn detect_layout_and_regions(
+        &self,
+        page_image: &image::RgbImage,
+    ) -> Result<
+        (
+            Vec<crate::domain::structure::LayoutElement>,
+            Option<Vec<crate::domain::structure::RegionBlock>>,
+        ),
+        OCRError,
+    > {
+        use oar_ocr_core::core::traits::task::ImageTaskInput;
+        use oar_ocr_core::domain::structure::RegionBlock;
+
+        let input = ImageTaskInput::new(vec![page_image.clone()]);
+        let t_layout = Instant::now();
+        let layout_result = self
+            .pipeline
+            .layout_detection_adapter
+            .execute(input, None)?;
+        let layout_dur = t_layout.elapsed();
+
+        let mut layout_elements = layout_result
+            .elements
+            .first()
+            .map(|elements| Self::layout_elements_from_detection(elements))
+            .unwrap_or_default();
+
+        let mut detected_region_blocks: Option<Vec<RegionBlock>> = None;
+        if let Some(ref region_adapter) = self.pipeline.region_detection_adapter {
+            let region_input = ImageTaskInput::new(vec![page_image.clone()]);
+            let t_region = Instant::now();
+            if let Ok(region_result) = region_adapter.execute(region_input, None)
+                && let Some(region_elements) = region_result.elements.first()
+                && !region_elements.is_empty()
+            {
+                let blocks: Vec<RegionBlock> = region_elements
+                    .iter()
+                    .map(|e| RegionBlock {
+                        bbox: e.bbox.clone(),
+                        confidence: e.score,
+                        order_index: None,
+                        element_indices: Vec::new(),
+                    })
+                    .collect();
+                detected_region_blocks = Some(blocks);
+            }
+            tracing::debug!(
+                "structure stage: region detection {:.1} ms, blocks={}",
+                t_region.elapsed().as_secs_f64() * 1000.0,
+                detected_region_blocks.as_ref().map_or(0, Vec::len)
+            );
+        }
+
+        Self::finish_layout_elements(&mut layout_elements);
+        tracing::debug!(
+            "structure stage: layout detection {:.1} ms, elements={}",
+            layout_dur.as_secs_f64() * 1000.0,
+            layout_elements.len()
+        );
+
+        Ok((layout_elements, detected_region_blocks))
+    }
+
+    fn recognize_formulas(
+        &self,
+        page_image: &image::RgbImage,
+        layout_elements: &[crate::domain::structure::LayoutElement],
+    ) -> Result<Vec<crate::domain::structure::FormulaResult>, OCRError> {
+        use oar_ocr_core::core::traits::task::ImageTaskInput;
+        use oar_ocr_core::domain::structure::FormulaResult;
+        use oar_ocr_core::utils::BBoxCrop;
+
+        let Some(ref formula_adapter) = self.pipeline.formula_recognition_adapter else {
+            return Ok(Vec::new());
+        };
+
+        let formula_elements: Vec<_> = layout_elements
+            .iter()
+            .filter(|e| e.element_type.is_formula())
+            .collect();
+
+        if formula_elements.is_empty() {
+            tracing::debug!(
+                "Formula recognition skipped: no formula regions from layout detection"
+            );
+            return Ok(Vec::new());
+        }
+
+        let mut crops = Vec::new();
+        let mut bboxes = Vec::new();
+
+        for elem in &formula_elements {
+            match BBoxCrop::crop_bounding_box(page_image, &elem.bbox) {
+                Ok(crop) => {
+                    crops.push(crop);
+                    bboxes.push(elem.bbox.clone());
+                }
+                Err(err) => {
+                    tracing::warn!("Formula region crop failed: {}", err);
+                }
+            }
+        }
+
+        if crops.is_empty() {
+            tracing::debug!(
+                "Formula recognition skipped: all formula crops failed for {} regions",
+                formula_elements.len()
+            );
+            return Ok(Vec::new());
+        }
+
+        let t_formula = Instant::now();
+        let batch_size = formula_adapter.recommended_batch_size().max(1);
+        let crop_count = bboxes.len();
+        let mut formula_results = Vec::with_capacity(crop_count);
+        let mut score_results = Vec::with_capacity(crop_count);
+        let mut remaining_crops = crops.into_iter();
+        loop {
+            let chunk_vec: Vec<_> = remaining_crops.by_ref().take(batch_size).collect();
+            if chunk_vec.is_empty() {
+                break;
+            }
+
+            let output = formula_adapter.execute(ImageTaskInput::new(chunk_vec), None)?;
+            formula_results.extend(output.formulas);
+            score_results.extend(output.scores);
+        }
+        tracing::debug!(
+            "structure stage: formula recognition {:.1} ms, crops={}, batches={}, batch_size={}",
+            t_formula.elapsed().as_secs_f64() * 1000.0,
+            crop_count,
+            crop_count.div_ceil(batch_size),
+            batch_size
+        );
+
+        let mut formulas = Vec::new();
+        for ((bbox, formula), score) in bboxes.into_iter().zip(formula_results).zip(score_results) {
+            let width = bbox.x_max() - bbox.x_min();
+            let height = bbox.y_max() - bbox.y_min();
+            if width <= 0.0 || height <= 0.0 {
+                tracing::warn!(
+                    "Skipping formula with non-positive bbox dimensions: w={:.2}, h={:.2}",
+                    width,
+                    height
+                );
+                continue;
+            }
+
+            formulas.push(FormulaResult {
+                bbox,
+                latex: formula,
+                confidence: score.unwrap_or(0.0),
+            });
+        }
+
+        Ok(formulas)
+    }
+
+    fn detect_seal_text(
+        &self,
+        page_image: &image::RgbImage,
+        layout_elements: &mut Vec<crate::domain::structure::LayoutElement>,
+    ) -> Result<(), OCRError> {
+        use oar_ocr_core::core::traits::task::ImageTaskInput;
+        use oar_ocr_core::domain::structure::{LayoutElement, LayoutElementType};
+        use oar_ocr_core::processors::Point;
+        use oar_ocr_core::utils::BBoxCrop;
+
+        let Some(ref seal_adapter) = self.pipeline.seal_text_detection_adapter else {
+            return Ok(());
+        };
+
+        let seal_regions: Vec<_> = layout_elements
+            .iter()
+            .filter(|e| e.element_type == LayoutElementType::Seal)
+            .map(|e| e.bbox.clone())
+            .collect();
+
+        if seal_regions.is_empty() {
+            tracing::debug!("Seal detection skipped: no seal regions from layout detection");
+            return Ok(());
+        }
+
+        let mut seal_crops = Vec::new();
+        let mut crop_offsets = Vec::new();
+
+        for region_bbox in &seal_regions {
+            match BBoxCrop::crop_bounding_box(page_image, region_bbox) {
+                Ok(crop) => {
+                    seal_crops.push(crop);
+                    crop_offsets.push((region_bbox.x_min(), region_bbox.y_min()));
+                }
+                Err(err) => {
+                    tracing::warn!("Seal region crop failed: {}", err);
+                }
+            }
+        }
+
+        if seal_crops.is_empty() {
+            return Ok(());
+        }
+
+        let input = ImageTaskInput::new(seal_crops);
+        let seal_result = seal_adapter.execute(input, None)?;
+
+        for ((dx, dy), detections) in crop_offsets.iter().zip(seal_result.detections) {
+            for detection in detections {
+                let translated_bbox = crate::processors::BoundingBox::new(
+                    detection
+                        .bbox
+                        .points
+                        .iter()
+                        .map(|p| Point::new(p.x + dx, p.y + dy))
+                        .collect(),
+                );
+
+                layout_elements.push(
+                    LayoutElement::new(translated_bbox, LayoutElementType::Seal, detection.score)
+                        .with_label("seal".to_string()),
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn sort_layout_elements_enhanced(
+        layout_elements: &mut Vec<crate::domain::structure::LayoutElement>,
+        page_width: f32,
+        page_height: f32,
+    ) {
+        use oar_ocr_core::processors::layout_sorting::{SortableElement, sort_layout_enhanced};
+
+        if layout_elements.is_empty() {
+            return;
+        }
+
+        let sortable_elements: Vec<_> = layout_elements
+            .iter()
+            .map(|e| SortableElement {
+                bbox: e.bbox.clone(),
+                element_type: e.element_type,
+                num_lines: e.num_lines,
+            })
+            .collect();
+
+        let sorted_indices = sort_layout_enhanced(&sortable_elements, page_width, page_height);
+        if sorted_indices.len() != layout_elements.len() {
+            return;
+        }
+
+        let sorted_elements: Vec<_> = sorted_indices
+            .into_iter()
+            .map(|idx| layout_elements[idx].clone())
+            .collect();
+        *layout_elements = sorted_elements;
+    }
+
+    fn assign_region_block_membership(
+        region_blocks: &mut [crate::domain::structure::RegionBlock],
+        layout_elements: &[crate::domain::structure::LayoutElement],
+    ) {
+        use std::cmp::Ordering;
+
+        if region_blocks.is_empty() {
+            return;
+        }
+
+        region_blocks.sort_by(|a, b| {
+            a.bbox
+                .y_min()
+                .partial_cmp(&b.bbox.y_min())
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| {
+                    a.bbox
+                        .x_min()
+                        .partial_cmp(&b.bbox.x_min())
+                        .unwrap_or(Ordering::Equal)
+                })
+        });
+
+        for (i, region) in region_blocks.iter_mut().enumerate() {
+            region.order_index = Some((i + 1) as u32);
+            region.element_indices.clear();
+        }
+
+        if layout_elements.is_empty() {
+            return;
+        }
+
+        for (elem_idx, elem) in layout_elements.iter().enumerate() {
+            let elem_area = elem.bbox.area();
+            if elem_area <= 0.0 {
+                continue;
+            }
+
+            let mut best_region: Option<usize> = None;
+            let mut best_ioa = 0.0f32;
+
+            for (region_idx, region) in region_blocks.iter().enumerate() {
+                let intersection = elem.bbox.intersection_area(&region.bbox);
+                if intersection <= 0.0 {
+                    continue;
+                }
+                let ioa = intersection / elem_area;
+                if ioa > best_ioa {
+                    best_ioa = ioa;
+                    best_region = Some(region_idx);
+                }
+            }
+
+            if let Some(region_idx) = best_region
+                && best_ioa >= REGION_MEMBERSHIP_IOA_THRESHOLD
+            {
+                region_blocks[region_idx].element_indices.push(elem_idx);
+            }
+        }
+    }
+
+    fn run_overall_ocr(
+        &self,
+        page_image: &image::RgbImage,
+        layout_elements: &[crate::domain::structure::LayoutElement],
+        region_blocks: Option<&[crate::domain::structure::RegionBlock]>,
+    ) -> Result<Vec<crate::oarocr::TextRegion>, OCRError> {
+        use crate::oarocr::TextRegion;
+        use oar_ocr_core::core::traits::task::ImageTaskInput;
+        use std::sync::Arc;
+
+        let Some(ref text_detection_adapter) = self.pipeline.text_detection_adapter else {
+            return Ok(Vec::new());
+        };
+        let Some(ref text_recognition_adapter) = self.pipeline.text_recognition_adapter else {
+            return Ok(Vec::new());
+        };
+
+        let mut text_regions = Vec::new();
+
+        // Mask formula regions before text detection only when formula
+        // recognition is enabled. With formula recognition disabled, PaddleX
+        // keeps formula-like regions in overall OCR output.
+        let mut ocr_image = page_image.clone();
+        if self.pipeline.formula_recognition_adapter.is_some() {
+            let mask_bboxes: Vec<crate::processors::BoundingBox> = layout_elements
+                .iter()
+                .filter(|e| e.element_type.is_formula())
+                .map(|e| e.bbox.clone())
+                .collect();
+
+            if !mask_bboxes.is_empty() {
+                crate::utils::mask_regions(&mut ocr_image, &mask_bboxes, [255, 255, 255]);
+            }
+        }
+
+        // Text detection (on masked image).
+        let input = ImageTaskInput::new(vec![ocr_image.clone()]);
+        let t_text_det = Instant::now();
+        let det_result = text_detection_adapter.execute(input, None)?;
+        let text_det_dur = t_text_det.elapsed();
+
+        let mut detection_boxes = if let Some(detections) = det_result.detections.first() {
+            detections
+                .iter()
+                .map(|d| d.bbox.clone())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        // Debug: raw text detection boxes from overall OCR (before any splitting).
+        let raw_detection_boxes = detection_boxes.clone();
+        if tracing::enabled!(tracing::Level::DEBUG) && !raw_detection_boxes.is_empty() {
+            let raw_rects: Vec<[f32; 4]> = raw_detection_boxes
+                .iter()
+                .map(|b| [b.x_min(), b.y_min(), b.x_max(), b.y_max()])
+                .collect();
+            tracing::debug!("overall OCR text det boxes (raw): {:?}", raw_rects);
+        }
+
+        // Cross-layout re-recognition: split text det boxes that span multiple layout/region boxes.
+        if !detection_boxes.is_empty() {
+            let mut split_boxes = Vec::new();
+            let mut split_count = 0usize;
+
+            let container_boxes: Vec<crate::processors::BoundingBox> =
+                if let Some(regions) = region_blocks {
+                    regions.iter().map(|r| r.bbox.clone()).collect()
+                } else {
+                    layout_elements
+                        .iter()
+                        .filter(|e| {
+                            matches!(
+                            e.element_type,
+                            crate::domain::structure::LayoutElementType::DocTitle
+                                | crate::domain::structure::LayoutElementType::ParagraphTitle
+                                | crate::domain::structure::LayoutElementType::Text
+                                | crate::domain::structure::LayoutElementType::Content
+                                | crate::domain::structure::LayoutElementType::Abstract
+                                | crate::domain::structure::LayoutElementType::Header
+                                | crate::domain::structure::LayoutElementType::Footer
+                                | crate::domain::structure::LayoutElementType::Footnote
+                                | crate::domain::structure::LayoutElementType::Number
+                                | crate::domain::structure::LayoutElementType::Reference
+                                | crate::domain::structure::LayoutElementType::ReferenceContent
+                                | crate::domain::structure::LayoutElementType::Algorithm
+                                | crate::domain::structure::LayoutElementType::AsideText
+                                | crate::domain::structure::LayoutElementType::List
+                                | crate::domain::structure::LayoutElementType::FigureTitle
+                                | crate::domain::structure::LayoutElementType::TableTitle
+                                | crate::domain::structure::LayoutElementType::ChartTitle
+                                | crate::domain::structure::LayoutElementType::FigureTableChartTitle
+                        )
+                        })
+                        .map(|e| e.bbox.clone())
+                        .collect()
+                };
+
+            if !container_boxes.is_empty() {
+                for bbox in detection_boxes.into_iter() {
+                    let mut intersections: Vec<crate::processors::BoundingBox> = Vec::new();
+                    let self_area = bbox.area();
+                    if self_area <= 0.0 {
+                        split_boxes.push(bbox);
+                        continue;
+                    }
+
+                    for container in &container_boxes {
+                        let inter_x_min = bbox.x_min().max(container.x_min());
+                        let inter_y_min = bbox.y_min().max(container.y_min());
+                        let inter_x_max = bbox.x_max().min(container.x_max());
+                        let inter_y_max = bbox.y_max().min(container.y_max());
+
+                        if inter_x_max - inter_x_min <= 2.0 || inter_y_max - inter_y_min <= 2.0 {
+                            continue;
+                        }
+
+                        let inter_bbox = crate::processors::BoundingBox::from_coords(
+                            inter_x_min,
+                            inter_y_min,
+                            inter_x_max,
+                            inter_y_max,
+                        );
+                        let inter_area = inter_bbox.area();
+                        if inter_area <= 0.0 {
+                            continue;
+                        }
+
+                        let ioa = inter_area / self_area;
+                        if ioa >= TEXT_BOX_SPLIT_IOA_THRESHOLD {
+                            intersections.push(inter_bbox);
+                        }
+                    }
+
+                    if intersections.len() >= 2 {
+                        split_count += intersections.len();
+                        split_boxes.extend(intersections);
+                    } else {
+                        split_boxes.push(bbox);
+                    }
+                }
+
+                if split_count > 0 {
+                    tracing::debug!(
+                        "Cross-layout re-recognition: split {} text boxes into {} sub-boxes",
+                        split_count,
+                        split_boxes.len()
+                    );
+                }
+
+                detection_boxes = split_boxes;
+            }
+        }
+
+        // PaddleX sorts OCR detection boxes in reading order before cropping/recognition.
+        if !detection_boxes.is_empty() {
+            detection_boxes = oar_ocr_core::processors::sort_quad_boxes(&detection_boxes);
+        }
+
+        // Debug: boxes actually used for recognition cropping (after cross-layout splitting).
+        if tracing::enabled!(tracing::Level::DEBUG) && !detection_boxes.is_empty() {
+            let pre_rec_rects: Vec<[f32; 4]> = detection_boxes
+                .iter()
+                .map(|b| [b.x_min(), b.y_min(), b.x_max(), b.y_max()])
+                .collect();
+            tracing::debug!(
+                "overall OCR boxes pre-recognition (after splitting): {:?}",
+                pre_rec_rects
+            );
+        }
+
+        if !detection_boxes.is_empty() {
+            use crate::oarocr::processors::{EdgeProcessor, TextCroppingProcessor};
+
+            let processor = TextCroppingProcessor::new(true);
+            let cropped =
+                processor.process((Arc::new(page_image.clone()), detection_boxes.clone()))?;
+
+            let mut cropped_images: Vec<image::RgbImage> = Vec::new();
+            let mut valid_indices: Vec<usize> = Vec::new();
+
+            for (idx, crop_result) in cropped.into_iter().enumerate() {
+                if let Some(img) = crop_result {
+                    cropped_images.push((*img).clone());
+                    valid_indices.push(idx);
+                }
+            }
+
+            if !cropped_images.is_empty() {
+                // PaddleX applies textline orientation in detection order first.
+                if let Some(ref tlo_adapter) = self.pipeline.text_line_orientation_adapter {
+                    let tlo_input = ImageTaskInput::new(cropped_images.clone());
+                    match tlo_adapter.execute(tlo_input, None) {
+                        Ok(tlo_result) => {
+                            for (i, classifications) in
+                                tlo_result.classifications.iter().enumerate()
+                            {
+                                if i >= cropped_images.len() {
+                                    break;
+                                }
+                                if let Some(top_cls) = classifications.first()
+                                    && top_cls.class_id == 1
+                                {
+                                    cropped_images[i] =
+                                        image::imageops::rotate180(&cropped_images[i]);
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                "Text-line orientation failed; proceeding without rotation: {}",
+                                err
+                            );
+                        }
+                    }
+                }
+
+                let mut items: Vec<(usize, f32, image::RgbImage)> = valid_indices
+                    .into_iter()
+                    .zip(cropped_images)
+                    .map(|(det_idx, img)| {
+                        let wh_ratio = img.width() as f32 / img.height().max(1) as f32;
+                        (det_idx, wh_ratio, img)
+                    })
+                    .collect();
+
+                items.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+                let batch_size = self
+                    .pipeline
+                    .region_batch_size
+                    .unwrap_or_else(|| text_recognition_adapter.recommended_batch_size())
+                    .max(1);
+                let mut recognized_by_det_idx: Vec<Option<(String, f32)>> =
+                    vec![None; detection_boxes.len()];
+                let mut rec_batches = 0usize;
+                let t_text_rec = Instant::now();
+
+                let mut remaining_items = items.into_iter();
+                loop {
+                    let batch_items: Vec<_> = remaining_items.by_ref().take(batch_size).collect();
+                    if batch_items.is_empty() {
+                        break;
+                    }
+
+                    let mut det_indices: Vec<usize> = Vec::with_capacity(batch_items.len());
+                    let mut rec_imgs: Vec<image::RgbImage> = Vec::with_capacity(batch_items.len());
+                    for (det_idx, _ratio, img) in batch_items {
+                        det_indices.push(det_idx);
+                        rec_imgs.push(img);
+                    }
+
+                    let rec_input = ImageTaskInput::new(rec_imgs);
+                    rec_batches += 1;
+                    match text_recognition_adapter.execute(rec_input, None) {
+                        Ok(rec_result) => {
+                            for ((det_idx, text), score) in det_indices
+                                .into_iter()
+                                .zip(rec_result.texts)
+                                .zip(rec_result.scores)
+                            {
+                                if text.is_empty() {
+                                    continue;
+                                }
+                                if let Some(slot) = recognized_by_det_idx.get_mut(det_idx) {
+                                    *slot = Some((text, score));
+                                }
+                            }
+                        }
+                        // Mirror the batch path (`precompute_overall_ocr_across_pages`):
+                        // surface the failure instead of silently dropping the text
+                        // for these crops.
+                        Err(err) => {
+                            tracing::warn!(
+                                "Text recognition batch failed for {} crops and will be skipped: {}",
+                                det_indices.len(),
+                                err
+                            );
+                        }
+                    }
+                }
+                tracing::debug!(
+                    "structure stage: text recognition {:.1} ms, crops={}, batches={}, batch_size={}",
+                    t_text_rec.elapsed().as_secs_f64() * 1000.0,
+                    detection_boxes.len(),
+                    rec_batches,
+                    batch_size
+                );
+
+                // Emit OCR regions in original detection order, matching PaddleX.
+                for (det_idx, rec) in recognized_by_det_idx.into_iter().enumerate() {
+                    let Some((text, score)) = rec else {
+                        continue;
+                    };
+                    let bbox = detection_boxes[det_idx].clone();
+                    text_regions.push(TextRegion {
+                        bounding_box: bbox.clone(),
+                        dt_poly: Some(bbox.clone()),
+                        rec_poly: Some(bbox),
+                        text: Some(Arc::from(text)),
+                        confidence: Some(score),
+                        orientation_angle: None,
+                        word_boxes: None,
+                        label: None,
+                    });
+                }
+            }
+        }
+
+        let batch_size = self
+            .pipeline
+            .region_batch_size
+            .unwrap_or_else(|| text_recognition_adapter.recommended_batch_size())
+            .max(1);
+        Self::refine_overall_ocr_with_layout(
+            &mut text_regions,
+            layout_elements,
+            region_blocks,
+            page_image,
+            text_recognition_adapter,
+            batch_size,
+        )?;
+        tracing::debug!(
+            "structure stage: text detection {:.1} ms, boxes={}, recognized_regions={}",
+            text_det_dur.as_secs_f64() * 1000.0,
+            detection_boxes.len(),
+            text_regions.len()
+        );
+
+        Ok(text_regions)
+    }
+
+    /// Analyzes the structure of a document image from a path.
+    ///
+    /// # Arguments
+    ///
+    /// * `image_path` - Path to the input image
+    ///
+    /// # Returns
+    ///
+    /// A `StructureResult` containing detected layout elements, tables, formulas, and text.
+    pub fn predict(&self, image_path: impl Into<PathBuf>) -> Result<StructureResult, OCRError> {
+        let image_path = image_path.into();
+
+        // Load the image
+        let image = image::open(&image_path).map_err(|e| OCRError::InvalidInput {
+            message: format!(
+                "failed to load image from '{}': {}",
+                image_path.display(),
+                e
+            ),
+        })?;
+
+        let mut result = self.predict_image(image.to_rgb8())?;
+        result.input_path = std::sync::Arc::from(image_path.to_string_lossy().as_ref());
+        Ok(result)
+    }
+
+    /// Preprocesses a page image before layout detection. Batch callers fill the
+    /// layout fields later so model inference can run across pages.
+    fn preprocess_page(&self, image: image::RgbImage) -> Result<PreparedPage, OCRError> {
+        use crate::oarocr::preprocess::DocumentPreprocessor;
+        use std::sync::Arc;
+
+        let preprocessor = DocumentPreprocessor::new(
+            self.pipeline.document_orientation_adapter.as_ref(),
+            self.pipeline.rectification_adapter.as_ref(),
+        );
+        let preprocess = preprocessor.preprocess(Arc::new(image))?;
+        let current_image = preprocess.image;
+        let orientation_angle = preprocess.orientation_angle;
+        let rectified_img = preprocess.rectified_img;
+        let rotation = preprocess.rotation;
+
+        Ok(PreparedPage {
+            current_image,
+            orientation_angle,
+            rectified_img,
+            rotation,
+            layout_elements: Vec::new(),
+            detected_region_blocks: None,
+            precomputed_text_regions: None,
+        })
+    }
+
+    /// Preprocesses a page image and runs layout detection, returning intermediate
+    /// results ready for formula recognition and downstream processing.
+    fn prepare_page(&self, image: image::RgbImage) -> Result<PreparedPage, OCRError> {
+        let mut prepared = self.preprocess_page(image)?;
+        let (layout_elements, detected_region_blocks) =
+            self.detect_layout_and_regions(&prepared.current_image)?;
+        prepared.layout_elements = layout_elements;
+        prepared.detected_region_blocks = detected_region_blocks;
+        Ok(prepared)
+    }
+
+    /// Completes page analysis given a `PreparedPage` and pre-computed formula results.
+    /// Runs seal detection, OCR, table analysis, stitching, and coordinate transforms.
+    fn complete_page(
+        &self,
+        prepared: PreparedPage,
+        mut formulas: Vec<crate::domain::structure::FormulaResult>,
+    ) -> Result<StructureResult, OCRError> {
+        use std::sync::Arc;
+
+        let PreparedPage {
+            current_image,
+            orientation_angle,
+            rectified_img,
+            rotation,
+            mut layout_elements,
+            mut detected_region_blocks,
+            precomputed_text_regions,
+        } = prepared;
+
+        let mut tables = Vec::new();
+
+        self.detect_seal_text(&current_image, &mut layout_elements)?;
+
+        // Sort layout elements after all detection/augmentation steps (formulas/seals)
+        // so reading order includes any injected blocks.
+        if !layout_elements.is_empty() {
+            let (width, height) = if let Some(img) = &rectified_img {
+                (img.width() as f32, img.height() as f32)
+            } else {
+                (current_image.width() as f32, current_image.height() as f32)
+            };
+            Self::sort_layout_elements_enhanced(&mut layout_elements, width, height);
+        }
+
+        if let Some(ref mut regions) = detected_region_blocks {
+            Self::assign_region_block_membership(regions, &layout_elements);
+        }
+
+        let t_ocr = Instant::now();
+        let mut text_regions = if let Some(text_regions) = precomputed_text_regions {
+            text_regions
+        } else {
+            self.run_overall_ocr(
+                &current_image,
+                &layout_elements,
+                detected_region_blocks.as_deref(),
+            )?
+        };
+        let ocr_dur = t_ocr.elapsed();
+
+        {
+            let t_tables = Instant::now();
+            let analyzer = crate::oarocr::table_analyzer::TableAnalyzer::new(
+                crate::oarocr::table_analyzer::TableAnalyzerConfig {
+                    table_classification_adapter: self
+                        .pipeline
+                        .table_classification_adapter
+                        .as_ref(),
+                    table_orientation_adapter: self.pipeline.table_orientation_adapter.as_ref(),
+                    table_structure_recognition_adapter: self
+                        .pipeline
+                        .table_structure_recognition_adapter
+                        .as_ref(),
+                    wired_table_structure_adapter: self
+                        .pipeline
+                        .wired_table_structure_adapter
+                        .as_ref(),
+                    wireless_table_structure_adapter: self
+                        .pipeline
+                        .wireless_table_structure_adapter
+                        .as_ref(),
+                    table_cell_detection_adapter: self
+                        .pipeline
+                        .table_cell_detection_adapter
+                        .as_ref(),
+                    wired_table_cell_adapter: self.pipeline.wired_table_cell_adapter.as_ref(),
+                    wireless_table_cell_adapter: self.pipeline.wireless_table_cell_adapter.as_ref(),
+                    use_e2e_wired_table_rec: self.pipeline.use_e2e_wired_table_rec,
+                    use_e2e_wireless_table_rec: self.pipeline.use_e2e_wireless_table_rec,
+                    use_wired_table_cells_trans_to_html: self
+                        .pipeline
+                        .use_wired_table_cells_trans_to_html,
+                    use_wireless_table_cells_trans_to_html: self
+                        .pipeline
+                        .use_wireless_table_cells_trans_to_html,
+                },
+            );
+            tables.extend(analyzer.analyze_tables(&current_image, &layout_elements)?);
+            tracing::debug!(
+                "structure stage: table analysis {:.1} ms, tables={}",
+                t_tables.elapsed().as_secs_f64() * 1000.0,
+                tables.len()
+            );
+        }
+        tracing::debug!(
+            "structure stage: overall OCR total {:.1} ms, regions={}",
+            ocr_dur.as_secs_f64() * 1000.0,
+            text_regions.len()
+        );
+
+        // 5b. Optional OCR box splitting by table cell boundaries.
+        //
+        // Split OCR boxes that span multiple table cells horizontally and re-recognize
+        // the smaller segments. This mirrors `split_ocr_bboxes_by_table_cells`:
+        // - For each OCR box that overlaps >= k table cells, split at cell boundaries
+        // - Re-run recognition on each split crop
+        // - Replace the original OCR box with the split boxes + texts
+        let has_detection_backed_table_cells = tables.iter().any(|table| !table.is_e2e);
+        if has_detection_backed_table_cells
+            && !text_regions.is_empty()
+            && let Some(ref text_rec_adapter) = self.pipeline.text_recognition_adapter
+        {
+            Self::split_ocr_bboxes_by_table_cells(
+                &tables,
+                &mut text_regions,
+                &current_image,
+                text_rec_adapter,
+            )?;
+        }
+
+        // Transform bounding boxes back to original coordinate system if rotation was applied.
+        // If rectification was applied, keep coordinates in rectified space (UVDoc can't be inverted).
+        if let Some(rot) = rotation {
+            let rotated_width = rot.rotated_width;
+            let rotated_height = rot.rotated_height;
+            let angle = rot.angle;
+
+            // Transform layout elements
+            for element in &mut layout_elements {
+                element.bbox =
+                    element
+                        .bbox
+                        .rotate_back_to_original(angle, rotated_width, rotated_height);
+            }
+
+            // Transform table bounding boxes and cells
+            for table in &mut tables {
+                table.bbox =
+                    table
+                        .bbox
+                        .rotate_back_to_original(angle, rotated_width, rotated_height);
+
+                // Transform cell bounding boxes
+                for cell in &mut table.cells {
+                    cell.bbox =
+                        cell.bbox
+                            .rotate_back_to_original(angle, rotated_width, rotated_height);
+                }
+            }
+
+            // Transform formula bounding boxes
+            for formula in &mut formulas {
+                formula.bbox =
+                    formula
+                        .bbox
+                        .rotate_back_to_original(angle, rotated_width, rotated_height);
+            }
+
+            // Transform text region polygons, bounding boxes, and word boxes
+            for region in &mut text_regions {
+                region.dt_poly = region
+                    .dt_poly
+                    .take()
+                    .map(|poly| poly.rotate_back_to_original(angle, rotated_width, rotated_height));
+                region.rec_poly = region
+                    .rec_poly
+                    .take()
+                    .map(|poly| poly.rotate_back_to_original(angle, rotated_width, rotated_height));
+                region.bounding_box = region.bounding_box.rotate_back_to_original(
+                    angle,
+                    rotated_width,
+                    rotated_height,
+                );
+
+                if let Some(ref word_boxes) = region.word_boxes {
+                    let transformed_word_boxes: Vec<_> = word_boxes
+                        .iter()
+                        .map(|wb| wb.rotate_back_to_original(angle, rotated_width, rotated_height))
+                        .collect();
+                    region.word_boxes = Some(transformed_word_boxes);
+                }
+            }
+
+            // Transform region block bounding boxes
+            if let Some(ref mut regions) = detected_region_blocks {
+                for region in regions.iter_mut() {
+                    region.bbox =
+                        region
+                            .bbox
+                            .rotate_back_to_original(angle, rotated_width, rotated_height);
+                }
+            }
+        }
+
+        // PaddleX: convert_formula_res_to_ocr_format — inject formula results into
+        // the overall OCR pool so they participate in normal block matching and table
+        // cell matching. The raw LaTeX text is used here (no $...$ wrapping);
+        // wrapping is handled by to_markdown() for formula elements, by
+        // stitch_tables() for table cells, and by sort_and_join_texts for inline formulas.
+        for formula in &formulas {
+            let w = formula.bbox.x_max() - formula.bbox.x_min();
+            let h = formula.bbox.y_max() - formula.bbox.y_min();
+            if w > 1.0 && h > 1.0 {
+                let mut region = crate::oarocr::TextRegion::new(formula.bbox.clone());
+                region.text = Some(formula.latex.clone().into());
+                region.confidence = Some(1.0);
+                region.label = Some("formula".into()); // Mark as formula for inline wrapping
+                text_regions.push(region);
+            }
+        }
+
+        // Construct and return result
+        // Ensure rectified_img is always set for markdown image extraction
+        // If no rectification was applied, use current_image
+        let final_image = rectified_img.unwrap_or_else(|| Arc::new((*current_image).clone()));
+        let mut result = StructureResult {
+            input_path: Arc::from("memory"),
+            index: 0,
+            layout_elements,
+            tables,
+            formulas,
+            text_regions: if text_regions.is_empty() {
+                None
+            } else {
+                Some(text_regions)
+            },
+            orientation_angle,
+            region_blocks: detected_region_blocks,
+            rectified_img: Some(final_image),
+            page_continuation_flags: None,
+        };
+
+        // Stitch text results into layout elements and tables
+        // Note: When region_blocks is present, stitching preserves the hierarchical order
+        use crate::oarocr::stitching::{ResultStitcher, StitchConfig};
+        let stitch_cfg = StitchConfig::default();
+        ResultStitcher::stitch_with_config(&mut result, &stitch_cfg);
+
+        Ok(result)
+    }
+
+    /// Analyzes the structure of a single document image.
+    pub fn predict_image(&self, image: image::RgbImage) -> Result<StructureResult, OCRError> {
+        let t_total = Instant::now();
+        let prepared = self.prepare_page(image)?;
+        let formulas =
+            self.recognize_formulas(&prepared.current_image, &prepared.layout_elements)?;
+        let result = self.complete_page(prepared, formulas)?;
+        tracing::debug!(
+            "structure stage: total predict_image {:.1} ms",
+            t_total.elapsed().as_secs_f64() * 1000.0
+        );
+        Ok(result)
+    }
+
+    fn precompute_overall_ocr_across_pages(
+        &self,
+        prepared_pages: &mut [Result<PreparedPage, OCRError>],
+    ) {
+        use crate::oarocr::TextRegion;
+        use crate::oarocr::processors::{EdgeProcessor, TextCroppingProcessor};
+        use oar_ocr_core::core::traits::task::ImageTaskInput;
+        use std::sync::Arc;
+
+        let Some(ref text_detection_adapter) = self.pipeline.text_detection_adapter else {
+            return;
+        };
+        let Some(ref text_recognition_adapter) = self.pipeline.text_recognition_adapter else {
+            return;
+        };
+
+        // Seal detection augments layout before OCR in the single-page path. Keep
+        // that path for seal-enabled pipelines until seal detection is batched too.
+        if self.pipeline.seal_text_detection_adapter.is_some() {
+            return;
+        }
+
+        let image_batch_size = self
+            .pipeline
+            .image_batch_size
+            .unwrap_or_else(|| text_detection_adapter.recommended_batch_size())
+            .max(1);
+
+        let t_total = Instant::now();
+
+        #[derive(Default)]
+        struct PageOcrState {
+            detection_boxes: Vec<crate::processors::BoundingBox>,
+            recognized: Vec<Option<(String, f32)>>,
+        }
+
+        struct RecItem {
+            page_idx: usize,
+            det_idx: usize,
+            wh_ratio: f32,
+            image: Arc<image::RgbImage>,
+        }
+
+        let mut page_states: Vec<Option<PageOcrState>> =
+            (0..prepared_pages.len()).map(|_| None).collect();
+        let mut rec_items: Vec<RecItem> = Vec::new();
+        let cropper = TextCroppingProcessor::new(true);
+        let mut batched_detection_boxes: Vec<Option<Vec<crate::processors::BoundingBox>>> =
+            (0..prepared_pages.len()).map(|_| None).collect();
+
+        let t_detection = Instant::now();
+        let mut det_page_indices = Vec::new();
+        let mut det_images = Vec::new();
+        for (page_idx, prepared) in prepared_pages.iter().enumerate() {
+            let Ok(prepared) = prepared else {
+                continue;
+            };
+
+            let mut ocr_image = (*prepared.current_image).clone();
+            if self.pipeline.formula_recognition_adapter.is_some() {
+                let mask_bboxes: Vec<crate::processors::BoundingBox> = prepared
+                    .layout_elements
+                    .iter()
+                    .filter(|e| e.element_type.is_formula())
+                    .map(|e| e.bbox.clone())
+                    .collect();
+                if !mask_bboxes.is_empty() {
+                    crate::utils::mask_regions(&mut ocr_image, &mask_bboxes, [255, 255, 255]);
+                }
+            }
+
+            det_page_indices.push(page_idx);
+            det_images.push(ocr_image);
+        }
+
+        let mut remaining_pages = det_page_indices.into_iter().zip(det_images);
+        loop {
+            let mut batch_page_indices = Vec::with_capacity(image_batch_size);
+            let mut batch_images = Vec::with_capacity(image_batch_size);
+            for (page_idx, image) in remaining_pages.by_ref().take(image_batch_size) {
+                batch_page_indices.push(page_idx);
+                batch_images.push(image);
+            }
+            if batch_page_indices.is_empty() {
+                break;
+            }
+            match text_detection_adapter.execute(ImageTaskInput::new(batch_images), None) {
+                Ok(det_result) => {
+                    for (offset, detections) in det_result.detections.into_iter().enumerate() {
+                        let page_idx = batch_page_indices[offset];
+                        batched_detection_boxes[page_idx] =
+                            Some(detections.into_iter().map(|d| d.bbox).collect());
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "Batch structure OCR text detection failed; falling back to per-page detection: {}",
+                        err
+                    );
+                }
+            }
+        }
+        let detection_ms = t_detection.elapsed().as_secs_f64() * 1000.0;
+
+        let t_crop = Instant::now();
+        for page_idx in 0..prepared_pages.len() {
+            let prepared = match &prepared_pages[page_idx] {
+                Ok(prepared) => prepared,
+                Err(_) => continue,
+            };
+
+            let mut detection_boxes = if let Some(boxes) = batched_detection_boxes[page_idx].take()
+            {
+                boxes
+            } else {
+                let mut ocr_image = (*prepared.current_image).clone();
+                if self.pipeline.formula_recognition_adapter.is_some() {
+                    let mask_bboxes: Vec<crate::processors::BoundingBox> = prepared
+                        .layout_elements
+                        .iter()
+                        .filter(|e| e.element_type.is_formula())
+                        .map(|e| e.bbox.clone())
+                        .collect();
+                    if !mask_bboxes.is_empty() {
+                        crate::utils::mask_regions(&mut ocr_image, &mask_bboxes, [255, 255, 255]);
+                    }
+                }
+
+                let det_result = match text_detection_adapter
+                    .execute(ImageTaskInput::new(vec![ocr_image]), None)
+                {
+                    Ok(result) => result,
+                    Err(err) => {
+                        prepared_pages[page_idx] = Err(err);
+                        continue;
+                    }
+                };
+
+                det_result
+                    .detections
+                    .first()
+                    .map(|detections| {
+                        detections
+                            .iter()
+                            .map(|d| d.bbox.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            };
+
+            if !detection_boxes.is_empty() {
+                let mut split_boxes = Vec::new();
+                let container_boxes: Vec<crate::processors::BoundingBox> = prepared
+                    .detected_region_blocks
+                    .as_ref()
+                    .map(|regions| regions.iter().map(|r| r.bbox.clone()).collect())
+                    .unwrap_or_else(|| {
+                        prepared
+                            .layout_elements
+                            .iter()
+                            .filter(|e| {
+                                matches!(
+                                    e.element_type,
+                                    crate::domain::structure::LayoutElementType::DocTitle
+                                        | crate::domain::structure::LayoutElementType::ParagraphTitle
+                                        | crate::domain::structure::LayoutElementType::Text
+                                        | crate::domain::structure::LayoutElementType::Content
+                                        | crate::domain::structure::LayoutElementType::Abstract
+                                        | crate::domain::structure::LayoutElementType::Header
+                                        | crate::domain::structure::LayoutElementType::Footer
+                                        | crate::domain::structure::LayoutElementType::Footnote
+                                        | crate::domain::structure::LayoutElementType::Number
+                                        | crate::domain::structure::LayoutElementType::Reference
+                                        | crate::domain::structure::LayoutElementType::ReferenceContent
+                                        | crate::domain::structure::LayoutElementType::Algorithm
+                                        | crate::domain::structure::LayoutElementType::AsideText
+                                        | crate::domain::structure::LayoutElementType::List
+                                        | crate::domain::structure::LayoutElementType::FigureTitle
+                                        | crate::domain::structure::LayoutElementType::TableTitle
+                                        | crate::domain::structure::LayoutElementType::ChartTitle
+                                        | crate::domain::structure::LayoutElementType::FigureTableChartTitle
+                                )
+                            })
+                            .map(|e| e.bbox.clone())
+                            .collect()
+                    });
+
+                if !container_boxes.is_empty() {
+                    for bbox in detection_boxes.into_iter() {
+                        let mut intersections: Vec<crate::processors::BoundingBox> = Vec::new();
+                        let self_area = bbox.area();
+                        if self_area <= 0.0 {
+                            split_boxes.push(bbox);
+                            continue;
+                        }
+
+                        for container in &container_boxes {
+                            let inter_x_min = bbox.x_min().max(container.x_min());
+                            let inter_y_min = bbox.y_min().max(container.y_min());
+                            let inter_x_max = bbox.x_max().min(container.x_max());
+                            let inter_y_max = bbox.y_max().min(container.y_max());
+
+                            if inter_x_max - inter_x_min <= 2.0 || inter_y_max - inter_y_min <= 2.0
+                            {
+                                continue;
+                            }
+
+                            let inter_bbox = crate::processors::BoundingBox::from_coords(
+                                inter_x_min,
+                                inter_y_min,
+                                inter_x_max,
+                                inter_y_max,
+                            );
+                            let inter_area = inter_bbox.area();
+                            if inter_area <= 0.0 {
+                                continue;
+                            }
+
+                            if inter_area / self_area >= TEXT_BOX_SPLIT_IOA_THRESHOLD {
+                                intersections.push(inter_bbox);
+                            }
+                        }
+
+                        if intersections.len() >= 2 {
+                            split_boxes.extend(intersections);
+                        } else {
+                            split_boxes.push(bbox);
+                        }
+                    }
+                    detection_boxes = split_boxes;
+                }
+            }
+
+            if !detection_boxes.is_empty() {
+                detection_boxes = oar_ocr_core::processors::sort_quad_boxes(&detection_boxes);
+            }
+
+            let state = PageOcrState {
+                recognized: vec![None; detection_boxes.len()],
+                detection_boxes,
+            };
+
+            if !state.detection_boxes.is_empty() {
+                match cropper.process((
+                    Arc::clone(&prepared.current_image),
+                    state.detection_boxes.clone(),
+                )) {
+                    Ok(cropped) => {
+                        for (det_idx, crop_result) in cropped.into_iter().enumerate() {
+                            let Some(img) = crop_result else {
+                                continue;
+                            };
+                            let wh_ratio = img.width() as f32 / img.height().max(1) as f32;
+                            rec_items.push(RecItem {
+                                page_idx,
+                                det_idx,
+                                wh_ratio,
+                                image: img,
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        prepared_pages[page_idx] = Err(err);
+                        continue;
+                    }
+                }
+            }
+
+            page_states[page_idx] = Some(state);
+        }
+        let crop_ms = t_crop.elapsed().as_secs_f64() * 1000.0;
+
+        let mut tlo_ms = 0.0;
+        let mut recognition_ms = 0.0;
+        if !rec_items.is_empty() {
+            if let Some(ref tlo_adapter) = self.pipeline.text_line_orientation_adapter {
+                let t_tlo = Instant::now();
+                let input = ImageTaskInput::from_arc_images(
+                    rec_items
+                        .iter()
+                        .map(|item| Arc::clone(&item.image))
+                        .collect(),
+                );
+                match tlo_adapter.execute(input, None) {
+                    Ok(tlo_result) => {
+                        for (item, classifications) in
+                            rec_items.iter_mut().zip(tlo_result.classifications)
+                        {
+                            if let Some(top_cls) = classifications.first()
+                                && top_cls.class_id == 1
+                            {
+                                item.image = Arc::new(image::imageops::rotate180(&*item.image));
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "Text-line orientation failed; proceeding without rotation: {}",
+                            err
+                        );
+                    }
+                }
+                tlo_ms = t_tlo.elapsed().as_secs_f64() * 1000.0;
+            }
+
+            rec_items.sort_by(|a, b| {
+                a.wh_ratio
+                    .partial_cmp(&b.wh_ratio)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            let batch_size = self
+                .pipeline
+                .region_batch_size
+                .unwrap_or_else(|| text_recognition_adapter.recommended_batch_size())
+                .max(1);
+
+            let t_recognition = Instant::now();
+            let mut start = 0usize;
+            while start < rec_items.len() {
+                let end = (start + batch_size).min(rec_items.len());
+                let chunk = &rec_items[start..end];
+                let rec_input = ImageTaskInput::from_arc_images(
+                    chunk.iter().map(|item| Arc::clone(&item.image)).collect(),
+                );
+                match text_recognition_adapter.execute(rec_input, None) {
+                    Ok(rec_result) => {
+                        for (i, item) in chunk.iter().enumerate() {
+                            let text = rec_result.texts.get(i).cloned().unwrap_or_default();
+                            if text.is_empty() {
+                                continue;
+                            }
+                            let score = rec_result.scores.get(i).copied().unwrap_or(0.0);
+                            if let Some(Some(state)) = page_states.get_mut(item.page_idx)
+                                && let Some(slot) = state.recognized.get_mut(item.det_idx)
+                            {
+                                *slot = Some((text, score));
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "Text recognition batch failed for {} crops and will be skipped: {}",
+                            end - start,
+                            err
+                        );
+                    }
+                }
+                start = end;
+            }
+            recognition_ms = t_recognition.elapsed().as_secs_f64() * 1000.0;
+        }
+
+        let batch_size = self
+            .pipeline
+            .region_batch_size
+            .unwrap_or_else(|| text_recognition_adapter.recommended_batch_size())
+            .max(1);
+
+        let t_refine = Instant::now();
+        let mut precomputed_pages = 0usize;
+        let mut text_region_count = 0usize;
+        for page_idx in 0..prepared_pages.len() {
+            let Some(state) = page_states[page_idx].take() else {
+                continue;
+            };
+            let Ok(prepared) = &mut prepared_pages[page_idx] else {
+                continue;
+            };
+
+            let mut text_regions = Vec::new();
+            for (det_idx, rec) in state.recognized.into_iter().enumerate() {
+                let Some((text, score)) = rec else {
+                    continue;
+                };
+                let bbox = state.detection_boxes[det_idx].clone();
+                text_regions.push(TextRegion {
+                    bounding_box: bbox.clone(),
+                    dt_poly: Some(bbox.clone()),
+                    rec_poly: Some(bbox),
+                    text: Some(Arc::from(text)),
+                    confidence: Some(score),
+                    orientation_angle: None,
+                    word_boxes: None,
+                    label: None,
+                });
+            }
+
+            if let Err(err) = Self::refine_overall_ocr_with_layout(
+                &mut text_regions,
+                &prepared.layout_elements,
+                prepared.detected_region_blocks.as_deref(),
+                &prepared.current_image,
+                text_recognition_adapter,
+                batch_size,
+            ) {
+                prepared_pages[page_idx] = Err(err);
+                continue;
+            }
+
+            text_region_count += text_regions.len();
+            prepared.precomputed_text_regions = Some(text_regions);
+            precomputed_pages += 1;
+        }
+        let refine_ms = t_refine.elapsed().as_secs_f64() * 1000.0;
+
+        tracing::debug!(
+            "structure batch OCR: pages={}, regions={}, detection={:.1} ms, crop/split={:.1} ms, tlo={:.1} ms, recognition={:.1} ms, refine={:.1} ms, total={:.1} ms",
+            precomputed_pages,
+            text_region_count,
+            detection_ms,
+            crop_ms,
+            tlo_ms,
+            recognition_ms,
+            refine_ms,
+            t_total.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
+    /// Analyzes multiple document page images with configured batching.
+    ///
+    /// Image-level stages are chunked according to `image_batch_size` when
+    /// configured, otherwise the layout adapter's recommended batch size is used.
+    /// OCR recognition crops are aggregated across the full input set and split
+    /// according to `region_batch_size` when configured.
+    ///
+    /// Per-page errors are returned individually so that a failure on one page does
+    /// not abort the remaining pages.
+    pub fn predict_images(
+        &self,
+        images: Vec<image::RgbImage>,
+    ) -> Vec<Result<StructureResult, OCRError>> {
+        use oar_ocr_core::core::traits::task::ImageTaskInput;
+        use oar_ocr_core::domain::structure::FormulaResult;
+        use oar_ocr_core::utils::BBoxCrop;
+
+        let image_batch_size = self
+            .pipeline
+            .image_batch_size
+            .unwrap_or_else(|| {
+                self.pipeline
+                    .layout_detection_adapter
+                    .recommended_batch_size()
+            })
+            .max(1);
+
+        if images.is_empty() {
+            return Vec::new();
+        }
+
+        let t_total = Instant::now();
+
+        // Phase 1: Preprocess every page, then run layout/region detection in
+        // batches. The original single-page path is still used as a fallback if
+        // a batched layout call fails.
+        // Pages that fail preparation are recorded as Err and skipped in later phases.
+        let t_preprocess = Instant::now();
+        let mut prepared_pages: Vec<Result<PreparedPage, OCRError>> = images
+            .into_iter()
+            .map(|image| self.preprocess_page(image))
+            .collect();
+        let preprocess_ms = t_preprocess.elapsed().as_secs_f64() * 1000.0;
+
+        let batch_pages: Vec<(usize, std::sync::Arc<image::RgbImage>)> = prepared_pages
+            .iter()
+            .enumerate()
+            .filter_map(|(page_idx, prepared)| {
+                prepared
+                    .as_ref()
+                    .ok()
+                    .map(|page| (page_idx, std::sync::Arc::clone(&page.current_image)))
+            })
+            .collect();
+
+        let t_layout = Instant::now();
+        if !batch_pages.is_empty() {
+            for page_chunk in batch_pages.chunks(image_batch_size) {
+                let layout_input = ImageTaskInput::from_arc_images(
+                    page_chunk
+                        .iter()
+                        .map(|(_, img)| std::sync::Arc::clone(img))
+                        .collect(),
+                );
+                match self
+                    .pipeline
+                    .layout_detection_adapter
+                    .execute(layout_input, None)
+                {
+                    Ok(layout_result) => {
+                        for (batch_idx, (page_idx, _)) in page_chunk.iter().enumerate() {
+                            if let Ok(prepared) = &mut prepared_pages[*page_idx] {
+                                let mut layout_elements = layout_result
+                                    .elements
+                                    .get(batch_idx)
+                                    .map(|elements| Self::layout_elements_from_detection(elements))
+                                    .unwrap_or_default();
+                                Self::finish_layout_elements(&mut layout_elements);
+                                prepared.layout_elements = layout_elements;
+                            }
+                        }
+
+                        if let Some(ref region_adapter) = self.pipeline.region_detection_adapter {
+                            let region_input = ImageTaskInput::from_arc_images(
+                                page_chunk
+                                    .iter()
+                                    .map(|(_, img)| std::sync::Arc::clone(img))
+                                    .collect(),
+                            );
+                            match region_adapter.execute(region_input, None) {
+                                Ok(region_result) => {
+                                    for (batch_idx, (page_idx, _)) in page_chunk.iter().enumerate()
+                                    {
+                                        let Some(region_elements) =
+                                            region_result.elements.get(batch_idx)
+                                        else {
+                                            continue;
+                                        };
+                                        if region_elements.is_empty() {
+                                            continue;
+                                        }
+                                        if let Ok(prepared) = &mut prepared_pages[*page_idx] {
+                                            prepared.detected_region_blocks = Some(
+                                                region_elements
+                                                    .iter()
+                                                    .map(|e| {
+                                                        crate::domain::structure::RegionBlock {
+                                                            bbox: e.bbox.clone(),
+                                                            confidence: e.score,
+                                                            order_index: None,
+                                                            element_indices: Vec::new(),
+                                                        }
+                                                    })
+                                                    .collect(),
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::warn!("Batch region detection failed: {}", err);
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "Batch layout detection failed; falling back to per-page layout: {}",
+                            err
+                        );
+                        for (page_idx, _) in page_chunk {
+                            if let Ok(prepared) = &mut prepared_pages[*page_idx] {
+                                match self.detect_layout_and_regions(&prepared.current_image) {
+                                    Ok((layout_elements, region_blocks)) => {
+                                        prepared.layout_elements = layout_elements;
+                                        prepared.detected_region_blocks = region_blocks;
+                                    }
+                                    Err(err) => {
+                                        prepared_pages[*page_idx] = Err(err);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let layout_ms = t_layout.elapsed().as_secs_f64() * 1000.0;
+
+        // Phase 2: Batch formula recognition across all successfully prepared pages.
+        let t_formula = Instant::now();
+        let num_pages = prepared_pages.len();
+        let mut per_page_formulas: Vec<Vec<FormulaResult>> =
+            (0..num_pages).map(|_| Vec::new()).collect();
+
+        if let Some(ref formula_adapter) = self.pipeline.formula_recognition_adapter {
+            let mut all_crops: Vec<image::RgbImage> = Vec::new();
+            let mut crop_meta: Vec<(usize, oar_ocr_core::processors::BoundingBox)> = Vec::new();
+
+            for (page_idx, prepared) in prepared_pages.iter().enumerate() {
+                let prepared = match prepared {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                for elem in prepared
+                    .layout_elements
+                    .iter()
+                    .filter(|e| e.element_type.is_formula())
+                {
+                    match BBoxCrop::crop_bounding_box(&prepared.current_image, &elem.bbox) {
+                        Ok(crop) => {
+                            all_crops.push(crop);
+                            crop_meta.push((page_idx, elem.bbox.clone()));
+                        }
+                        Err(err) => {
+                            tracing::warn!("Formula region crop failed (batch): {}", err);
+                        }
+                    }
+                }
+            }
+
+            if !all_crops.is_empty() {
+                let batch_size = formula_adapter.recommended_batch_size().max(1);
+                let mut remaining_crops = all_crops.into_iter();
+                let mut meta_offset = 0;
+
+                loop {
+                    let chunk_vec: Vec<_> = remaining_crops.by_ref().take(batch_size).collect();
+                    let chunk_len = chunk_vec.len();
+                    if chunk_len == 0 {
+                        break;
+                    }
+
+                    let chunk_meta = &crop_meta[meta_offset..meta_offset + chunk_len];
+                    match formula_adapter.execute(ImageTaskInput::new(chunk_vec), None) {
+                        Ok(formula_output) => {
+                            for ((page_idx, bbox), (formula_text, score)) in
+                                chunk_meta.iter().cloned().zip(
+                                    formula_output
+                                        .formulas
+                                        .into_iter()
+                                        .zip(formula_output.scores),
+                                )
+                            {
+                                let width = bbox.x_max() - bbox.x_min();
+                                let height = bbox.y_max() - bbox.y_min();
+                                if width > 0.0 && height > 0.0 {
+                                    per_page_formulas[page_idx].push(FormulaResult {
+                                        bbox,
+                                        latex: formula_text,
+                                        confidence: score.unwrap_or(0.0),
+                                    });
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!("Batch formula recognition failed: {}", err);
+                        }
+                    }
+                    meta_offset += chunk_len;
+                }
+            }
+        }
+        let formula_ms = t_formula.elapsed().as_secs_f64() * 1000.0;
+
+        let t_ocr = Instant::now();
+        self.precompute_overall_ocr_across_pages(&mut prepared_pages);
+        let ocr_ms = t_ocr.elapsed().as_secs_f64() * 1000.0;
+
+        // Phase 3: Complete each page with its pre-computed formula results.
+        let t_complete = Instant::now();
+        let results: Vec<_> = prepared_pages
+            .into_iter()
+            .zip(per_page_formulas)
+            .map(|(prepared, formulas)| self.complete_page(prepared?, formulas))
+            .collect();
+        tracing::debug!(
+            "structure batch: pages={}, preprocess={:.1} ms, layout/region={:.1} ms, formula={:.1} ms, ocr={:.1} ms, complete={:.1} ms, total={:.1} ms",
+            num_pages,
+            preprocess_ms,
+            layout_ms,
+            formula_ms,
+            ocr_ms,
+            t_complete.elapsed().as_secs_f64() * 1000.0,
+            t_total.elapsed().as_secs_f64() * 1000.0
+        );
+        results
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_structure_builder_new() {
+        let builder = OARStructureBuilder::new("layout.onnx");
+        assert_eq!(
+            builder.layout_detection_model.as_path(),
+            Some(std::path::Path::new("layout.onnx"))
+        );
+        assert!(builder.table_classification_model.is_none());
+        assert!(builder.formula_recognition_model.is_none());
+    }
+
+    #[test]
+    fn test_structure_builder_with_table_components() {
+        let builder = OARStructureBuilder::new("layout.onnx")
+            .with_table_classification("table_cls.onnx")
+            .with_table_cell_detection("table_cell.onnx", TableType::Wired)
+            .with_table_structure_recognition("table_struct.onnx", TableType::Wired)
+            .table_structure_dict_path("table_structure_dict.txt");
+
+        assert!(builder.table_classification_model.is_some());
+        assert!(builder.table_cell_detection_model.is_some());
+        assert!(builder.table_structure_recognition_model.is_some());
+        assert_eq!(
+            builder.table_cell_detection_type,
+            Some(Ok(TableType::Wired))
+        );
+        assert_eq!(
+            builder.table_structure_recognition_type,
+            Some(Ok(TableType::Wired))
+        );
+        assert_eq!(
+            builder.table_structure_dict_path,
+            Some(PathBuf::from("table_structure_dict.txt"))
+        );
+    }
+
+    #[test]
+    fn test_structure_builder_with_formula() {
+        let builder = OARStructureBuilder::new("layout.onnx").with_formula_recognition(
+            "formula.onnx",
+            "tokenizer.json",
+            FormulaModelKind::PPFormulaNet,
+        );
+
+        assert!(builder.formula_recognition_model.is_some());
+        assert!(builder.formula_tokenizer_path.is_some());
+        assert_eq!(
+            builder.formula_recognition_type,
+            Some(Ok(FormulaModelKind::PPFormulaNet))
+        );
+    }
+
+    #[test]
+    fn test_structure_builder_accepts_strict_string_kinds() {
+        let builder = OARStructureBuilder::new("layout.onnx")
+            .with_table_cell_detection("table_cell.onnx", "wireless")
+            .with_table_structure_recognition("table_struct.onnx", "wired")
+            .with_formula_recognition("formula.onnx", "tokenizer.json", "pp_formulanet");
+
+        assert_eq!(
+            builder.table_cell_detection_type,
+            Some(Ok(TableType::Wireless))
+        );
+        assert_eq!(
+            builder.table_structure_recognition_type,
+            Some(Ok(TableType::Wired))
+        );
+        assert_eq!(
+            builder.formula_recognition_type,
+            Some(Ok(FormulaModelKind::PPFormulaNet))
+        );
+    }
+
+    #[test]
+    fn test_structure_builder_preserves_invalid_string_kinds() {
+        let builder = OARStructureBuilder::new("layout.onnx")
+            .with_table_cell_detection("table_cell.onnx", "border-ish")
+            .with_formula_recognition("formula.onnx", "tokenizer.json", "mystery");
+
+        assert!(matches!(
+            builder.table_cell_detection_type,
+            Some(Err(ref message)) if message.contains("border-ish")
+        ));
+        assert!(matches!(
+            builder.formula_recognition_type,
+            Some(Err(ref message)) if message.contains("mystery")
+        ));
+    }
+
+    #[test]
+    fn test_structure_builder_reports_invalid_string_before_loading_models() {
+        let result = OARStructureBuilder::new("missing-layout.onnx")
+            .with_table_cell_detection("missing-table.onnx", "border-ish")
+            .build();
+        let error = match result {
+            Ok(_) => panic!("invalid selector must fail"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("table_cell_detection"));
+        assert!(message.contains("border-ish"));
+    }
+
+    #[test]
+    fn test_structure_builder_with_ocr() {
+        let builder =
+            OARStructureBuilder::new("layout.onnx").with_ocr("det.onnx", "rec.onnx", "dict.txt");
+
+        assert!(builder.text_detection_model.is_some());
+        assert!(builder.text_recognition_model.is_some());
+        assert!(builder.character_dict_path.is_some());
+    }
+
+    #[test]
+    fn test_structure_builder_with_configuration() {
+        let layout_config = LayoutDetectionConfig {
+            score_threshold: 0.5,
+            max_elements: 100,
+            ..Default::default()
+        };
+
+        let builder = OARStructureBuilder::new("layout.onnx")
+            .layout_detection_config(layout_config.clone())
+            .image_batch_size(4)
+            .region_batch_size(64);
+
+        assert!(builder.layout_detection_config.is_some());
+        assert_eq!(builder.image_batch_size, Some(4));
+        assert_eq!(builder.region_batch_size, Some(64));
+    }
+
+    #[test]
+    fn test_structure_batch_size_validation() {
+        assert!(OARStructureBuilder::validate_batch_size("image_batch_size", 1).is_ok());
+        assert!(
+            OARStructureBuilder::validate_batch_size(
+                "region_batch_size",
+                OARStructureBuilder::MAX_BATCH_SIZE,
+            )
+            .is_ok()
+        );
+
+        let err = OARStructureBuilder::validate_batch_size("image_batch_size", 0).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("image_batch_size"));
+        assert!(msg.contains(&format!("1..={}", OARStructureBuilder::MAX_BATCH_SIZE)));
+    }
+}

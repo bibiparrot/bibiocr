@@ -1,0 +1,16 @@
+# "system" follows the Android/desktop locale. Supported: zh-CN, en, ja, ko,
+# ru, fr, es, de, it, and pt.
+[locale]
+language = "system"
+
+[download]
+# Keep `.part` files and send an HTTP Range request on the next launch.
+resume = true
+
+# Empty = hf-mirror.com for Chinese, huggingface.co for other locales.
+# The HF_ENDPOINT environment variable overrides this value.
+hf_endpoint = ""
+
+# Empty = direct GitHub download. Supported placeholders are {giturl},
+# ${giturl}, and {$giturl}.
+github_proxy = "https://gh-proxy.com/{giturl}"
