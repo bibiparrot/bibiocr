@@ -15,6 +15,10 @@ on:
         description: Publish all packages after successful builds
         type: boolean
         default: false
+      macos_only:
+        description: Rebuild only macOS packages
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -42,17 +46,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: windows-2025
-            platform: windows-x86_64
-          - runner: macos-15-intel
-            platform: macos-x86_64
-          - runner: macos-latest
-            platform: macos-arm64
-          - runner: ubuntu-22.04
-            platform: linux-x86_64
-          - runner: ubuntu-22.04-arm
-            platform: linux-arm64
+        include: ${{ fromJSON(inputs.macos_only && '[{"runner":"macos-15-intel","platform":"macos-x86_64"},{"runner":"macos-latest","platform":"macos-arm64"}]' || '[{"runner":"windows-2025","platform":"windows-x86_64"},{"runner":"macos-15-intel","platform":"macos-x86_64"},{"runner":"macos-latest","platform":"macos-arm64"},{"runner":"ubuntu-22.04","platform":"linux-x86_64"},{"runner":"ubuntu-22.04-arm","platform":"linux-arm64"}]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
@@ -85,7 +79,7 @@ jobs:
           if-no-files-found: error
 
   android:
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && !inputs.macos_only)
     defaults:
       run:
         working-directory: mobile

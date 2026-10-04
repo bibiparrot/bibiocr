@@ -13,12 +13,14 @@ else
   app="dist/bibiocr-$version-linux-$arch"
   stage="$app/lib"
 fi
-mkdir -p "$stage/native-licenses"
+notice_dir="$stage"
+if [[ "$os" == Darwin ]]; then notice_dir="$app/Contents/Resources"; fi
+mkdir -p "$stage" "$notice_dir/native-licenses"
 cp "$release/bibiocr" "$stage/bibiocr"
-cp LICENSE THIRD_PARTY_NOTICES.md "$stage/"
-cp desktop/assets/fonts/LICENSE.txt "$stage/NotoSansCJK-LICENSE.txt"
-cp desktop/vendor/sherpa-onnx-sys/LICENSE "$stage/native-licenses/sherpa-onnx.txt"
-cp desktop/src/model_runtimes/third_party/onnxruntime/LICENSE "$stage/native-licenses/onnxruntime.txt"
+cp LICENSE THIRD_PARTY_NOTICES.md "$notice_dir/"
+cp desktop/assets/fonts/LICENSE.txt "$notice_dir/NotoSansCJK-LICENSE.txt"
+cp desktop/vendor/sherpa-onnx-sys/LICENSE "$notice_dir/native-licenses/sherpa-onnx.txt"
+cp desktop/src/model_runtimes/third_party/onnxruntime/LICENSE "$notice_dir/native-licenses/onnxruntime.txt"
 if [[ "$os" == Darwin ]]; then
   find "$release" -maxdepth 1 -name '*.dylib' -exec cp -L {} "$stage/" \;
   test -s "$stage/libsherpa-onnx-c-api.dylib"
